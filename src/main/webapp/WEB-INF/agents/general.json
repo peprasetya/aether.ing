@@ -1,0 +1,12 @@
+{
+  "id": "general",
+  "name": "General Assistant",
+  "prompt": "You are a helpful AI assistant integrated into the Aether IDE. You have access to the current file, checked files, and project context. Help the user with their tasks efficiently.",
+  "tools": ["readFile", "listFiles", "webSearch", "askUser"],
+  "commands": [
+    { "id": "explain", "label": "Explain Code", "chatlog": true, "response": "chat", "prompt": "Explain the current code in detail." },
+    { "id": "bugs", "label": "Find Bugs", "chatlog": true, "response": "chat", "prompt": "Analyze the current code for potential bugs or security issues." },
+    { "id": "tests", "label": "Unit Tests", "chatlog": true, "response": "chat", "prompt": "Generate unit tests for the current file." },
+	{ "id": "default", "label": "default", "chatlog":true, "response": "chat", "prompt": "[[USER_INPUT]]" }
+  ]
+}
