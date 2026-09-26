@@ -8,15 +8,23 @@ import ing.aether.CommandRegister;
 import ing.aether.Portal;
 import ing.aether.SessionTracker;
 import ing.aether.data.FileProvider;
+import ing.aether.tools.ai.ImageWorker;
 
 @CommandRegister(value="read", accessType=1, createSession=true, preventCache=true)
 public class DocumentBean extends BeanObject
 {
   private String fileContent = "";
+  private boolean image = false;
 
   public String getFileContent()
   {
     return fileContent;
+  }
+
+  // True when the opened file is an image: fileContent then holds its layer document, or is empty
+  public boolean isImage()
+  {
+    return image;
   }
 
   public String getFileName()
@@ -71,6 +79,20 @@ public class DocumentBean extends BeanObject
           }
         }
         
+        // Images open in the viewer: the response carries the layer document, never the pixels, and the
+        // text save buffer is left alone so no autosave baseline ever points at an image
+        if (ImageWorker.isImagePath(subPath))
+        {
+          image = true;
+          String sidecar = subPath + ImageWorker.SIDECAR_SUFFIX;
+          if (provider.exists(sidecar)) try (InputStream is = provider.getInputStream(sidecar))
+          {
+            fileContent = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+          }
+          if (isAjaxCall()) contentType = "text/plain; charset=utf-8";
+          return;
+        }
+
         if (currentPath.equals(bufferedPath) && session.getAttribute("bufferedContent") != null)
         {
           fileContent = (String) session.getAttribute("bufferedContent");

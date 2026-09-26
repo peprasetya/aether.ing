@@ -109,6 +109,11 @@ public class AetherWebSocket
           {
             // SURGICAL FIX: Clear historical stream buffer before starting a fresh chat turn
             sessionBuffers.remove(httpSession.getId());
+            ing.aether.tools.ai.AgentWorker.sendStatus(httpSession.getId(), "accepted", "Request accepted");
+            // Image agents: the image model and pane settings travel with every message; the image tools read them from the session
+            Object imageModel = data.get("image_model_id");
+            if (imageModel instanceof String && !((String) imageModel).isEmpty()) httpSession.setAttribute("imageModel", imageModel);
+            if (data.get("image_params") instanceof Map) httpSession.setAttribute("imageParams", data.get("image_params"));
             ing.aether.tools.ai.AgentWorker.process(httpSession, agentId, modelId, thinkingMode, contextFiles, msg, selectedText, terminalOutput);
           } else
           {

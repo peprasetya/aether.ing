@@ -120,6 +120,32 @@ public class LlmProviders
     return qualify("gemma4:e4b-it-bf16");
   }
 
+  // /v1/models carries no capability flag, so the kind is read from the model name. Image models
+  // can only draw and embedding models can only embed: neither may appear in a chat selector
+  private static final Pattern IMAGE_MODEL=Pattern.compile("image|flux|sdxl|sd3|sd-?\\d|stable-?diffusion|hidream|kolors|dall-?e",Pattern.CASE_INSENSITIVE);
+  private static final Pattern EMBEDDING_MODEL=Pattern.compile("embed",Pattern.CASE_INSENSITIVE);
+
+  public static final String KindText="text";
+  public static final String KindImage="image";
+  public static final String KindEmbedding="embedding";
+
+  public static String modelKind(String qualifiedModel)
+  {
+    if (qualifiedModel==null) return KindText;
+    int idx=qualifiedModel.indexOf(SEPARATOR);
+    String bare=idx>0?qualifiedModel.substring(idx+SEPARATOR.length()):qualifiedModel;
+    if (EMBEDDING_MODEL.matcher(bare).find()) return KindEmbedding;
+    if (IMAGE_MODEL.matcher(bare).find()) return KindImage;
+    return KindText;
+  }
+
+  public static List<String> filterKind(List<String> models,String kind)
+  {
+    List<String> result=new ArrayList<>();
+    for (String m:models) if (kind.equals(modelKind(m))) result.add(m);
+    return result;
+  }
+
   // Admins see everything; allowed users see only models passing the configured filters
   public static List<String> listModels(boolean isAdmin)
   {

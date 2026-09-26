@@ -122,6 +122,21 @@
     </div>
     <div id="panel"></div>
     <div id="editor-container" class="hidden"></div>
+    <div id="image-container" class="hidden">
+      <div class="image-toolbar">
+        <button class="p-btn" onclick="imageZoom(0)" title="Fit to pane">Fit</button>
+        <button class="p-btn" onclick="imageZoom(-1)" title="Zoom out">−</button>
+        <button class="p-btn" onclick="imageZoom(1)" title="Zoom in">+</button>
+        <button class="p-btn" onclick="document.getElementById('layer-upload').click()" title="Add an image from this device as a new layer">+ Layer</button>
+        <input type="file" id="layer-upload" accept="image/*" class="hidden" onchange="uploadLayerFile(this)">
+        <button class="p-btn" onclick="mergeLayers()" title="Save all visible layers as one new PNG">Merge ⇩</button>
+        <span id="image-info" class="image-info"></span>
+      </div>
+      <div class="image-body">
+        <div id="image-stage" class="image-stage"><canvas id="image-canvas"></canvas></div>
+        <div id="layer-panel" class="layer-panel"></div>
+      </div>
+    </div>
     <textarea id="file-content-buffer" style="display:none"></textarea>
   </div>
 
@@ -165,6 +180,7 @@
           <select id="model-select" class="model-select">
             <!-- Models will be populated here -->
           </select>
+          <select id="image-model-select" class="model-select hidden" title="Image model"></select>
           <select id="thinking-mode" class="thinking-select">
              <option value="off">Off</option>
              <option value="low">Low</option>
@@ -172,6 +188,28 @@
              <option value="high">High</option>
           </select>
         </div>
+        <!-- Outside #ai-selectors on purpose: menu.jsp regenerates that block and would reset these choices -->
+        <div id="image-ai-controls" class="image-ai-controls hidden">
+          <select id="image-size" title="Output size (multiples of 32)">
+            <option value="auto">Size: match canvas</option>
+            <option value="512x512">512×512</option>
+            <option value="768x768">768×768</option>
+            <option value="1024x1024">1024×1024</option>
+            <option value="768x512">768×512</option>
+            <option value="512x768">512×768</option>
+            <option value="1024x768">1024×768</option>
+            <option value="768x1024">768×1024</option>
+          </select>
+          <label title="Fewer steps is faster but rougher">Steps <input type="number" id="image-steps" min="4" max="50" value="14"></label>
+          <label><input type="checkbox" id="image-transparent"> Transparent</label>
+          <select id="image-source" title="What an edit sends to the image model">
+            <option value="canvas">Edit: whole canvas</option>
+            <option value="selected">Edit: selected layer</option>
+            <option value="layers">Edit: each visible layer</option>
+          </select>
+          <label title="Attach the canvas to chat messages; needs a vision-capable text model"><input type="checkbox" id="image-vision" checked> AI sees image</label>
+        </div>
+        <div id="ai-status" class="ai-status hidden"></div>
         <div class="prompt-btns" id="agent-commands">
           <!-- Agent specific buttons will be populated here -->
         </div>

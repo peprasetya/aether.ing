@@ -714,7 +714,8 @@ function setSaveStatus(status) {
 }
 
 function autoSave(callback) {
-  if (!editor || !currentFileUrl) {
+  // An open image is never saved as text: the hidden editor must not write into it
+  if (!editor || !currentFileUrl || isImageFile(currentFileUrl)) {
     if (typeof callback === 'function') callback();
     return;
   }
@@ -761,6 +762,7 @@ function fullSave(content, callback)
 }
 
 function triggerAutoSave() {
+  if (isImageFile(currentFileUrl)) return;
   setSaveStatus('unsaved');
   if (saveTimeout) clearTimeout(saveTimeout);
   saveTimeout = setTimeout(autoSave, AUTO_SAVE_DELAY);
@@ -897,6 +899,14 @@ function showItemMenu(event, kebabEl) {
     menu.appendChild(setWd);
   }
 
+  if (imgUrl && currentFileUrl === imgUrl && li.dataset.type == 3 && isImageFile(itemName) && itemPath !== imgUrl) {
+    const addLayer = document.createElement('div');
+    addLayer.className = 'dropdown-item';
+    addLayer.textContent = 'Add as Layer';
+    addLayer.onclick = function() { closeItemMenu(); addLayerFromPath(itemPath, itemName); };
+    menu.appendChild(addLayer);
+  }
+
   const rename = document.createElement('div');
   rename.className = 'dropdown-item';
   rename.textContent = 'Rename';
@@ -1005,8 +1015,19 @@ function pasteMovedItem() {
 
 let currentFileUrl = null;
 
+// Images open in the layer viewer instead of the text editor
+const IMAGE_EXTENSIONS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'avif', 'ico'];
+
+function isImageFile(filename) {
+  if (!filename) return false;
+  const lastDot = filename.lastIndexOf('.');
+  if (lastDot === -1) return false;
+  return IMAGE_EXTENSIONS.includes(filename.substring(lastDot + 1).toLowerCase());
+}
+
 function isSupportedFile(filename) {
   if (!filename) return false;
+  if (isImageFile(filename)) return true;
   const supportedExtensions = [
     'py', 'java', 'js', 'ts', 'jsx', 'tsx', 'css', 'scss', 'less', 'html', 'htm', 'jsp', 'php', 'asp', 'aspx',
     'sh', 'bat', 'c', 'cpp', 'h', 'hpp', 'cs', 'go', 'rs', 'rb', 'pl', 'pm', 'csv', 'json', 'xml', 'txt', 'md', 'markdown',
@@ -1079,6 +1100,7 @@ function treeItemClick(event) {
 }
 
 function openFileAction(url, el) {
+  flushImageSave();
   currentFileUrl = url;
   window.openedFile = url;
   updateActionButtons();
@@ -1089,7 +1111,7 @@ function openFileAction(url, el) {
   });
   el.classList.add('opened');
 
-  showView('editor');
+  showView(isImageFile(url) ? 'image' : 'editor');
   
   // IMMEDIATELY show loading state and clear content
   const filenameEl = document.getElementById('current-filename');
@@ -1178,8 +1200,16 @@ function showView(view) {
   const panel = document.getElementById('panel');
   const editorCont = document.getElementById('editor-container');
 
+  const imageCont = document.getElementById('image-container');
   if (panel) panel.classList.toggle('hidden', view !== 'browser');
   if (editorCont) editorCont.classList.toggle('hidden', view !== 'editor');
+  if (imageCont) imageCont.classList.toggle('hidden', view !== 'image');
+
+  if (view === 'image') {
+    const editorPane = document.getElementById('pane-editor');
+    if (workspace && editorPane && window.innerWidth <= 768) workspace.scrollTo({ left: editorPane.offsetLeft, behavior: 'smooth' });
+    requestAnimationFrame(renderImageCanvas);
+  }
 
   if (view === 'editor') {
     initEditor();
@@ -1633,13 +1663,17 @@ function restoreAIConfig()
   var thinkingSelect = document.getElementById('thinking-mode');
   var agentSelect = document.getElementById('agent-select');
 
+  var imageModelSelect = document.getElementById('image-model-select');
   if (cfg.model && modelSelect) modelSelect.value = cfg.model;
+  if (cfg.image_model && imageModelSelect) imageModelSelect.value = cfg.image_model;
   if (cfg.thinking_mode && thinkingSelect) thinkingSelect.value = cfg.thinking_mode;
   if (cfg.agent_id && agentSelect)
   {
     agentSelect.value = cfg.agent_id;
     onAgentChange();
   }
+  // menu.jsp re-renders the selectors hidden: re-apply the agent's visibility even without a saved agent
+  else if (agentSelect) onAgentChange();
 }
 
 function repairJson(json)
@@ -1878,8 +1912,8 @@ function onAIWsMessage(event)
     }
   } else if (data.type === 'plaintext')
   {
-    // Stream content directly into the editor at end of document
-    if (editor)
+    // Stream content directly into the editor at end of document (never into a hidden editor behind an image)
+    if (editor && !isImageFile(currentFileUrl))
     {
       editor.operation(function() {
         // Place cursor at end of document
@@ -1899,42 +1933,7 @@ function onAIWsMessage(event)
     
     if (data.responseType === 'variants_json')
     {
-      var json = extractAndRepairJson(aiResponseBuffer);
-      var extractedVariants = [];
-
-      if (json)
-      {
-        // Recursive crawler to dig out text variants regardless of strict schema
-        function extractVars(item)
-        {
-          if (typeof item === 'string')
-          {
-            var clean = item.trim();
-            // Stripping malformed prefixes like "text\n" or "text: "
-            if (clean.toLowerCase().startsWith('text\n')) clean = clean.substring(5).trim();
-            else if (clean.toLowerCase().startsWith('text:')) clean = clean.substring(5).trim();
-            
-            if (clean !== '') extractedVariants.push({ text: clean });
-          }
-          else if (Array.isArray(item))
-          {
-            for (var v = 0; v < item.length; v++) extractVars(item[v]);
-          }
-          else if (typeof item === 'object' && item !== null)
-          {
-            // Specifically target 'variants' or 'text' keys if they exist
-            if (item.variants) extractVars(item.variants);
-            else if (item.text) extractVars(item.text);
-            else
-            {
-              // Fallback: extract string values from all keys
-              var keys = Object.keys(item);
-              for (var k = 0; k < keys.length; k++) extractVars(item[keys[k]]);
-            }
-          }
-        }
-        extractVars(json);
-      }
+      var extractedVariants = extractVariantList(aiResponseBuffer);
       if (extractedVariants.length > 0 && !variantsRendered)
       {
         variantsRendered = true;
@@ -2011,10 +2010,192 @@ function onAIWsMessage(event)
   {
     window.aiConfig = data.config;
     restoreAIConfig();
+  } else if (data.type === 'chat_status')
+  {
+    updateAiStatus(data);
+  } else if (data.type === 'image_done')
+  {
+    onImageDone(data);
   } else if (data.type === 'monitor')
   {
     if (typeof renderMonitor === 'function') renderMonitor(data);
   }
+}
+
+// Pulls the variant texts out of a model's JSON reply regardless of the exact schema it chose;
+// shared by the live chat_done and by saved command entries re-rendered from history
+function extractVariantList(raw)
+{
+  var json = extractAndRepairJson(raw);
+  var extractedVariants = [];
+  if (!json) return extractedVariants;
+
+  // Recursive crawler to dig out text variants regardless of strict schema
+  function extractVars(item)
+  {
+    if (typeof item === 'string')
+    {
+      var clean = item.trim();
+      // Stripping malformed prefixes like "text\n" or "text: "
+      if (clean.toLowerCase().startsWith('text\n')) clean = clean.substring(5).trim();
+      else if (clean.toLowerCase().startsWith('text:')) clean = clean.substring(5).trim();
+
+      if (clean !== '') extractedVariants.push({ text: clean });
+    }
+    else if (Array.isArray(item))
+    {
+      for (var v = 0; v < item.length; v++) extractVars(item[v]);
+    }
+    else if (typeof item === 'object' && item !== null)
+    {
+      // Specifically target 'variants' or 'text' keys if they exist
+      if (item.variants) extractVars(item.variants);
+      else if (item.text) extractVars(item.text);
+      else
+      {
+        // Fallback: extract string values from all keys
+        var keys = Object.keys(item);
+        for (var k = 0; k < keys.length; k++) extractVars(item[keys[k]]);
+      }
+    }
+  }
+  extractVars(json);
+  return extractedVariants;
+}
+
+// Puts a message back into the chat input to edit and resend it
+function reuseInChat(text)
+{
+  const input = document.getElementById('chat-input');
+  if (!input) return;
+  input.value = text;
+  input.focus();
+  input.setSelectionRange(text.length, text.length);
+}
+
+// A saved non-chatlog command: the request as the user sent it, then its result as it was delivered
+function renderCommandEntry(entry, timeStr)
+{
+  const label = entry.label || entry.commandId || 'Command';
+  appendMessage('user', entry.input ? '**' + label + '**: ' + entry.input : '**' + label + '**', null, timeStr);
+  if (entry.error)
+  {
+    appendMessage('ai', '❌ **Error**: ' + entry.error, null, timeStr, entry.model);
+    return;
+  }
+  if (entry.responseType === 'variants_json')
+  {
+    const variants = extractVariantList(entry.content || '');
+    if (variants.length > 0) renderVariants(variants, entry.target, entry.model, timeStr);
+    else appendMessage('ai', entry.content || '', null, timeStr, entry.model);
+  }
+  else if (entry.responseType === 'image') appendImageResult(entry.content, entry.input, timeStr, entry.model);
+  else appendMessage('ai', entry.content || '', null, timeStr, entry.model);
+}
+
+// Chat card for an AI image: a thumbnail that opens the file
+function appendImageResult(path, prompt, timeStr, model)
+{
+  if (!path) return;
+  const msgDiv = appendMessage('ai', '🖼️ ' + pathName(path), null, timeStr, model);
+  if (!msgDiv) return;
+  const img = document.createElement('img');
+  img.className = 'chat-image-thumb';
+  img.src = imageUrlFor(path);
+  img.alt = prompt || '';
+  img.title = 'Open ' + pathName(path);
+  img.onclick = function() { openFileInEditor(path); };
+  msgDiv.querySelector('.msg-content').appendChild(img);
+  scrollToBottomIfWatching(document.getElementById('chat-history'));
+}
+
+function onImageDone(data)
+{
+  appendImageResult(data.path, data.prompt, null, data.model);
+  refreshTreeExplorer();
+  if (data.imagePath && data.imagePath === imgUrl && imgDoc)
+  {
+    // The server already appended this layer to the layer file: mirror it so the next autosave keeps it
+    if (data.layer && !imgDoc.layers.some(function(l) { return l.id === data.layer.id; }))
+    {
+      imgDoc.layers.push(data.layer);
+      imgSelectedId = data.layer.id;
+      loadLayerImages(function() { renderImageCanvas(); renderLayerPanel(); });
+    }
+  }
+  else if (!data.imagePath) openFileInEditor(data.path);
+}
+
+// Image settings from the chat pane, sent with every message of an image agent
+function imageParamsFromPane()
+{
+  const val = function(id) { const el = document.getElementById(id); return el ? el.value : null; };
+  const chk = function(id) { const el = document.getElementById(id); return !!(el && el.checked); };
+  return {
+    size: val('image-size') || 'auto',
+    steps: parseInt(val('image-steps'), 10) || 14,
+    transparent: chk('image-transparent'),
+    source: val('image-source') || 'canvas',
+    vision: chk('image-vision'),
+    selected: imgSelectedId || ''
+  };
+}
+
+// ===== Live request status (chat_status messages) =====
+let aiStatusStart = 0;
+let aiStatusTimer = null;
+let aiStatusText = '';
+let aiStatusTtft = null;
+let aiStatusEstimate = null;
+
+function formatSeconds(s)
+{
+  s = Math.max(0, Math.round(s));
+  return s < 60 ? s + 's' : Math.floor(s / 60) + 'm' + String(s % 60).padStart(2, '0') + 's';
+}
+
+function startAiStatus(text)
+{
+  aiStatusStart = Date.now();
+  aiStatusTtft = null;
+  aiStatusEstimate = null;
+  aiStatusText = text;
+  if (!aiStatusTimer) aiStatusTimer = setInterval(renderAiStatus, 500);
+  renderAiStatus();
+}
+
+function updateAiStatus(data)
+{
+  // A reconnect in the middle of a turn resumes the line without a local start
+  if (!aiStatusTimer) startAiStatus(data.text);
+  aiStatusText = data.text;
+  if (data.ttftMs) aiStatusTtft = data.ttftMs;
+  if (data.estimateSec) aiStatusEstimate = { start: Date.now(), sec: data.estimateSec };
+  else if (data.stage !== 'image') aiStatusEstimate = null;
+  renderAiStatus();
+}
+
+function renderAiStatus()
+{
+  const el = document.getElementById('ai-status');
+  if (!el) return;
+  let text = '⏳ ' + aiStatusText + ' · ' + formatSeconds((Date.now() - aiStatusStart) / 1000);
+  if (aiStatusTtft) text += ' · first token ' + (aiStatusTtft / 1000).toFixed(1) + 's';
+  if (aiStatusEstimate)
+  {
+    const left = aiStatusEstimate.sec - (Date.now() - aiStatusEstimate.start) / 1000;
+    text += left > 0 ? ' · ~' + formatSeconds(left) + ' left' : ' · longer than estimated';
+  }
+  el.textContent = text;
+  el.classList.remove('hidden');
+}
+
+function stopAiStatus()
+{
+  if (aiStatusTimer) clearInterval(aiStatusTimer);
+  aiStatusTimer = null;
+  const el = document.getElementById('ai-status');
+  if (el) el.classList.add('hidden');
 }
 
 function createReceivingIndicator(model)
@@ -2104,6 +2285,7 @@ function removeToolProgress()
 // Open a file in the editor pane by its resolved path (no tree element required)
 function openFileInEditor(fullPath)
 {
+  flushImageSave();
   currentFileUrl = fullPath;
   window.openedFile = fullPath;
   lastSavedContent = null;
@@ -2116,7 +2298,7 @@ function openFileInEditor(fullPath)
     filenameEl.classList.add('loading');
   }
   updateActionButtons();
-  showView('editor');
+  showView(isImageFile(fullPath) ? 'image' : 'editor');
   makeRequest('read/' + fullPath, null, false);
 }
 
@@ -2195,7 +2377,7 @@ function appendToolResult(name, result, isError, sub)
   scrollToBottomIfWatching(history);
 }
 
-function renderVariants(variants, target, model)
+function renderVariants(variants, target, model, timeStr)
 {
   const history = document.getElementById('chat-history');
   wasAtBottom = isAtBottom(history);
@@ -2208,9 +2390,16 @@ function renderVariants(variants, target, model)
   const msgDiv = document.createElement('div');
   msgDiv.className = 'msg ai';
   
-  const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const time = timeStr || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   const roleName = model || 'AI';
-  msgDiv.innerHTML = '<div class="msg-meta"><span class="msg-role-time"><span class="msg-role">' + roleName + '</span><span class="msg-time">' + time + '</span></span><button class="copy-msg-btn" title="Copy Message">📋</button></div>';
+  msgDiv.innerHTML = '<div class="msg-meta"><span class="msg-role-time"><span class="msg-role">' + roleName + '</span><span class="msg-time">' + time + '</span></span><span class="msg-actions"><button class="reuse-msg-btn" title="Reuse in chat input">↩</button><button class="copy-msg-btn" title="Copy Message">📋</button></span></div>';
+  // Copy and reuse act on all variants at once; each variant button still inserts only itself
+  const allText = variants.map(function(v) { return typeof v === 'string' ? v : (v.text || '').toString(); }).join('\n\n');
+  msgDiv.querySelector('.reuse-msg-btn').onclick = function(e) { e.stopPropagation(); reuseInChat(allText); };
+  msgDiv.querySelector('.copy-msg-btn').onclick = function(e) {
+    e.stopPropagation();
+    navigator.clipboard.writeText(allText).then(function() { showNotification("Copied to clipboard"); });
+  };
   
   const contentDiv = document.createElement('div');
   contentDiv.className = 'msg-content';
@@ -2310,6 +2499,13 @@ function onAgentChange()
   // Fallback to first agent if none matched and we have agents
   if (!currentAgent && aiAgents && aiAgents.length > 0) currentAgent = aiAgents[0];
 
+  // Image agents drive a second, image-only model plus the image settings; text agents never show them
+  const isImageAgent = !!(currentAgent && currentAgent.image);
+  const imageModelSelect = document.getElementById('image-model-select');
+  if (imageModelSelect) imageModelSelect.classList.toggle('hidden', !isImageAgent);
+  const imageControls = document.getElementById('image-ai-controls');
+  if (imageControls) imageControls.classList.toggle('hidden', !isImageAgent);
+
   console.log('Agent changed to:', currentAgent ? currentAgent.id : 'null', 'Commands:', currentAgent && currentAgent.commands ? currentAgent.commands.length : 0);
   renderAgentCommands();
 }
@@ -2340,6 +2536,12 @@ function renderAgentCommands()
 }
 function sendChatMessage(message, commandId, commandLabel)
 {
+  // The server composes the canvas from the saved layer file: an unsaved move must land before the request
+  if (imgSaveTimer || imgSaving)
+  {
+    flushImageSave(function() { sendChatMessage(message, commandId, commandLabel); });
+    return;
+  }
   variantsRendered = false;
   aiResponseBuffer = "";
   // Remove any leftover receiving indicator from a stopped/aborted variants stream so the new turn renders at the bottom
@@ -2380,9 +2582,16 @@ function sendChatMessage(message, commandId, commandLabel)
     selected_text: selectedText
   };
   if (pendingTerminalOutput) payload.terminal_output = pendingTerminalOutput;
+  if (currentAgent && currentAgent.image)
+  {
+    const imageModel = document.getElementById('image-model-select');
+    if (imageModel && imageModel.value) payload.image_model_id = imageModel.value;
+    payload.image_params = imageParamsFromPane();
+  }
   wsSend(JSON.stringify(payload));
   clearTerminalContext();
   setAiWorking(true);
+  startAiStatus('Sending…');
 }
 
 function stopAiActivity()
@@ -2406,6 +2615,7 @@ function setAiWorking(working)
   {
     if (sendBtn) sendBtn.classList.remove('hidden');
     if (stopBtn) stopBtn.classList.add('hidden');
+    stopAiStatus();
   }
 }
 
@@ -2939,7 +3149,7 @@ function appendMessage(role, content, thinking, timeStr, model)
 
   const time = timeStr || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   const roleName = (role === 'ai' && model) ? model : role.toUpperCase();
-  let html = '<div class="msg-meta"><span class="msg-role-time"><span class="msg-role">' + roleName + '</span><span class="msg-time">' + time + '</span></span><button class="copy-msg-btn" title="Copy Message">📋</button></div>';
+  let html = '<div class="msg-meta"><span class="msg-role-time"><span class="msg-role">' + roleName + '</span><span class="msg-time">' + time + '</span></span><span class="msg-actions"><button class="reuse-msg-btn" title="Reuse in chat input">↩</button><button class="copy-msg-btn" title="Copy Message">📋</button></span></div>';
 
   if (thinking)
     html += '<div class="thinking-block collapsed" onclick="this.classList.toggle(\'collapsed\')"><div class="thinking-header" onclick="event.stopPropagation(); this.closest(\'.thinking-block\').classList.toggle(\'collapsed\');">Thought Process ▾</div><div class="thinking-content">' + mdToHtml(thinking) + '</div></div>';
@@ -2947,17 +3157,27 @@ function appendMessage(role, content, thinking, timeStr, model)
   html += '<div class="msg-content">' + mdToHtml(content) + '</div>';
   msgDiv.innerHTML = html;
   
+  // Read at click time: a live-streamed reply starts empty and grows in dataset.raw
+  function messageText()
+  {
+    let text = msgDiv.dataset.raw || content || '';
+    if (role === 'user')
+    {
+      const prefixMatch = text.match(/^\*\*(.*?)\*\*: /);
+      if (prefixMatch) text = text.substring(prefixMatch[0].length);
+    }
+    return text;
+  }
+
+  const reuseBtn = msgDiv.querySelector('.reuse-msg-btn');
+  if (reuseBtn) reuseBtn.onclick = function(e) { e.stopPropagation(); reuseInChat(messageText()); };
+
   const copyBtn = msgDiv.querySelector('.copy-msg-btn');
   if (copyBtn)
   {
     copyBtn.onclick = function(e) {
       e.stopPropagation();
-      let textToCopy = content;
-      if (role === 'user')
-      {
-        const prefixMatch = content.match(/^\*\*(.*?)\*\*: /);
-        if (prefixMatch) textToCopy = content.substring(prefixMatch[0].length);
-      }
+      let textToCopy = messageText();
       navigator.clipboard.writeText(textToCopy).then(() => {
         showNotification("Copied to clipboard");
       }).catch(err => {
@@ -3062,6 +3282,10 @@ function renderChatHistory(history)
       {
          appendToolResult(msg.tool, msg.log_summary || msg.content, !!msg.error);
       }
+      else if (role === 'command')
+      {
+         renderCommandEntry(msg, timeStr);
+      }
       else if (role === 'assistant' && msg.tool_calls)
       {
          // Find tool calls and append them
@@ -3106,6 +3330,8 @@ function renderAiStats(stats)
                        '<div class="stats-item"><span class="stats-label">Prompt Tokens:</span><span class="stats-value">' + (stats.prompt_eval_count || 0) + '</span></div>' +
                        '<div class="stats-item"><span class="stats-label">Generated Tokens:</span><span class="stats-value">' + stats.eval_count + '</span></div>' +
                        '<div class="stats-item"><span class="stats-label">Generated TPS:</span><span class="stats-value">' + genTps + '</span></div>' +
+                       '<div class="stats-item"><span class="stats-label">First Token:</span><span class="stats-value">' + (stats.ttft_ms ? (stats.ttft_ms / 1000).toFixed(2) + 's' : '—') + '</span></div>' +
+                       '<div class="stats-item"><span class="stats-label">Total Time:</span><span class="stats-value">' + (stats.total_duration ? (stats.total_duration / 1e9).toFixed(1) + 's' : '—') + '</span></div>' +
                        '</div>';
   
   lastMsg.appendChild(statsDiv);
@@ -3417,4 +3643,678 @@ function clearTerminalContext()
   pendingTerminalOutput = null;
   var chip = document.getElementById('terminal-attach-chip');
   if (chip) chip.classList.add('hidden');
+}
+
+// ===== Image viewer: a layered canvas backed by "<image>.layers.json" =====
+// A layer is drawn exactly as ImageWorker.compose draws it on the server: translate to (x, y),
+// rotate, scale, then the image centred on that point. Keep the two in step, or the AI edits a
+// picture that differs from what the user sees.
+const IMAGE_SERVER_READABLE = ['png', 'jpg', 'jpeg', 'gif', 'bmp'];
+const IMAGE_HANDLE_RADIUS = 18;
+let imgUrl = null;            // full path of the open image
+let imgDoc = null;            // { version, width, height, layers: [{ id, name, src | url, x, y, scale, rotation, opacity, visible }] }
+let imgCache = {};            // layer file path -> loaded HTMLImageElement (null when it failed to load)
+let imgSelectedId = null;
+let imgView = { scale: 1, ox: 0, oy: 0 };
+let imgDrag = null;
+let imgSaveTimer = null;
+let imgSaving = false;
+let imgSaveWaiters = [];
+let imgViewerReady = false;
+let imgChecker = null;
+
+function encodePath(path)
+{
+  return path.split('/').map(encodeURIComponent).join('/');
+}
+
+function imageUrlFor(path)
+{
+  return '/image/' + encodePath(path);
+}
+
+function pathDir(path)
+{
+  const i = path.lastIndexOf('/');
+  return i === -1 ? '' : path.substring(0, i);
+}
+
+function pathName(path)
+{
+  const i = path.lastIndexOf('/');
+  return i === -1 ? path : path.substring(i + 1);
+}
+
+function pathExt(path)
+{
+  const n = pathName(path);
+  const i = n.lastIndexOf('.');
+  return i === -1 ? '' : n.substring(i + 1).toLowerCase();
+}
+
+function siblingPath(of, rel)
+{
+  return (pathDir(of) ? pathDir(of) + '/' : '') + rel;
+}
+
+// A layer names its file relative to the image's folder ("src") or by full path ("url")
+function layerFilePath(layer, baseUrl)
+{
+  return layer.url ? layer.url : siblingPath(baseUrl || imgUrl, layer.src);
+}
+
+function fileTimestamp()
+{
+  const d = new Date();
+  const p = function(n) { return String(n).padStart(2, '0'); };
+  return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+}
+
+function selectedLayer()
+{
+  if (!imgDoc || !imgSelectedId) return null;
+  for (var i = 0; i < imgDoc.layers.length; i++) if (imgDoc.layers[i].id === imgSelectedId) return imgDoc.layers[i];
+  return null;
+}
+
+// Called by read.jsp when the opened file is an image; the buffer holds its layer file, or nothing
+function openImageViewer()
+{
+  ensureImageViewer();
+  const buffer = document.getElementById('file-content-buffer');
+  const raw = buffer ? buffer.value : '';
+  if (buffer) buffer.value = '';
+  const openedFor = currentFileUrl;
+  imgUrl = openedFor;
+  imgCache = {};
+  imgSelectedId = null;
+  imgDoc = null;
+  renderImageCanvas();
+  showView('image');
+
+  if (raw && raw.trim())
+  {
+    try { imgDoc = JSON.parse(raw); } catch (e) { showNotification('Layer file unreadable, showing the image alone'); }
+  }
+  if (imgDoc && Array.isArray(imgDoc.layers))
+  {
+    loadLayerImages(function() { if (imgUrl === openedFor) { imageZoom(0); renderLayerPanel(); } });
+    return;
+  }
+
+  // Never layered: the image itself is the only layer, at its natural size
+  imgDoc = null;
+  const img = new Image();
+  img.onload = function()
+  {
+    if (imgUrl !== openedFor) return;
+    imgCache[openedFor] = img;
+    const w = img.naturalWidth || 512;
+    const h = img.naturalHeight || 512;
+    imgDoc = { version: 1, width: w, height: h, layers: [{ id: 'base', name: pathName(openedFor), src: pathName(openedFor), x: w / 2, y: h / 2, scale: 1, rotation: 0, opacity: 1, visible: true }] };
+    imageZoom(0);
+    renderLayerPanel();
+  };
+  img.onerror = function() { if (imgUrl === openedFor) showNotification('Cannot display ' + pathName(openedFor)); };
+  img.src = imageUrlFor(openedFor);
+}
+
+function loadLayerImages(done)
+{
+  const pending = imgDoc.layers.filter(function(l) { return !(layerFilePath(l) in imgCache); });
+  if (pending.length === 0) { done(); return; }
+  let left = pending.length;
+  pending.forEach(function(layer)
+  {
+    const path = layerFilePath(layer);
+    const img = new Image();
+    img.onload = function() { imgCache[path] = img; if (--left === 0) done(); };
+    img.onerror = function() { imgCache[path] = null; if (--left === 0) done(); };
+    img.src = imageUrlFor(path);
+  });
+}
+
+// Pointer, wheel and resize wiring, attached once
+function ensureImageViewer()
+{
+  if (imgViewerReady) return;
+  const canvas = document.getElementById('image-canvas');
+  const stage = document.getElementById('image-stage');
+  if (!canvas || !stage) return;
+  imgViewerReady = true;
+  canvas.addEventListener('pointerdown', onImagePointerDown);
+  canvas.addEventListener('pointermove', onImagePointerMove);
+  canvas.addEventListener('pointerup', onImagePointerUp);
+  canvas.addEventListener('pointercancel', onImagePointerUp);
+  canvas.addEventListener('wheel', function(e)
+  {
+    if (!imgDoc) return;
+    e.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    zoomImageAt(e.clientX - rect.left, e.clientY - rect.top, e.deltaY < 0 ? 1.1 : 1 / 1.1);
+    renderImageCanvas();
+  }, { passive: false });
+  if (window.ResizeObserver) new ResizeObserver(function() { renderImageCanvas(); }).observe(stage);
+}
+
+function screenToDoc(sx, sy)
+{
+  return { x: (sx - imgView.ox) / imgView.scale, y: (sy - imgView.oy) / imgView.scale };
+}
+
+function docToScreen(x, y)
+{
+  return { x: imgView.ox + x * imgView.scale, y: imgView.oy + y * imgView.scale };
+}
+
+function zoomImageAt(sx, sy, factor)
+{
+  const p = screenToDoc(sx, sy);
+  imgView.scale = Math.max(0.02, Math.min(32, imgView.scale * factor));
+  imgView.ox = sx - p.x * imgView.scale;
+  imgView.oy = sy - p.y * imgView.scale;
+}
+
+// dir 0 fits the canvas into the pane; +1 / -1 zoom around the pane centre
+function imageZoom(dir)
+{
+  const stage = document.getElementById('image-stage');
+  if (!stage || !imgDoc) return;
+  if (dir === 0)
+  {
+    const pad = 16;
+    const s = Math.min((stage.clientWidth - pad * 2) / imgDoc.width, (stage.clientHeight - pad * 2) / imgDoc.height);
+    imgView.scale = s > 0 ? s : 1;
+    imgView.ox = (stage.clientWidth - imgDoc.width * imgView.scale) / 2;
+    imgView.oy = (stage.clientHeight - imgDoc.height * imgView.scale) / 2;
+  }
+  else zoomImageAt(stage.clientWidth / 2, stage.clientHeight / 2, dir > 0 ? 1.25 : 0.8);
+  renderImageCanvas();
+}
+
+// Corner and rotation-knob positions of a layer, in document coordinates
+function layerGeometry(layer)
+{
+  const img = imgCache[layerFilePath(layer)];
+  if (!img) return null;
+  const s = layer.scale || 1;
+  const r = (layer.rotation || 0) * Math.PI / 180;
+  const hw = img.naturalWidth * s / 2;
+  const hh = img.naturalHeight * s / 2;
+  const cos = Math.cos(r);
+  const sin = Math.sin(r);
+  const pt = function(dx, dy) { return { x: layer.x + dx * cos - dy * sin, y: layer.y + dx * sin + dy * cos }; };
+  return { corners: [pt(-hw, -hh), pt(hw, -hh), pt(hw, hh), pt(-hw, hh)], topMid: pt(0, -hh), cos: cos, sin: sin, hw: hw, hh: hh };
+}
+
+function rotateKnob(g)
+{
+  const top = docToScreen(g.topMid.x, g.topMid.y);
+  return { x: top.x + g.sin * 28, y: top.y - g.cos * 28 };
+}
+
+function drawLayer(ctx, layer, alphaFactor)
+{
+  const img = imgCache[layerFilePath(layer)];
+  if (!img || layer.visible === false) return;
+  ctx.save();
+  ctx.globalAlpha = (layer.opacity == null ? 1 : layer.opacity) * alphaFactor;
+  ctx.translate(layer.x, layer.y);
+  ctx.rotate((layer.rotation || 0) * Math.PI / 180);
+  ctx.scale(layer.scale || 1, layer.scale || 1);
+  ctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
+  ctx.restore();
+}
+
+function renderImageCanvas()
+{
+  const stage = document.getElementById('image-stage');
+  const canvas = document.getElementById('image-canvas');
+  if (!stage || !canvas) return;
+  const dpr = window.devicePixelRatio || 1;
+  const cw = stage.clientWidth;
+  const ch = stage.clientHeight;
+  if (cw === 0 || ch === 0) return;
+  if (canvas.width !== Math.round(cw * dpr) || canvas.height !== Math.round(ch * dpr))
+  {
+    canvas.width = Math.round(cw * dpr);
+    canvas.height = Math.round(ch * dpr);
+    canvas.style.width = cw + 'px';
+    canvas.style.height = ch + 'px';
+  }
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!imgDoc) return;
+
+  ctx.setTransform(dpr * imgView.scale, 0, 0, dpr * imgView.scale, dpr * imgView.ox, dpr * imgView.oy);
+  // Checkerboard shows transparency, the way the result will be stored
+  if (!imgChecker)
+  {
+    const c = document.createElement('canvas');
+    c.width = 16;
+    c.height = 16;
+    const cc = c.getContext('2d');
+    cc.fillStyle = '#d9d9d9';
+    cc.fillRect(0, 0, 16, 16);
+    cc.fillStyle = '#f4f4f4';
+    cc.fillRect(0, 0, 8, 8);
+    cc.fillRect(8, 8, 8, 8);
+    imgChecker = ctx.createPattern(c, 'repeat');
+  }
+  ctx.fillStyle = imgChecker;
+  ctx.fillRect(0, 0, imgDoc.width, imgDoc.height);
+  // Parts outside the canvas are cut from the result: show them faintly so a layer can still be found
+  imgDoc.layers.forEach(function(l) { drawLayer(ctx, l, 0.25); });
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, 0, imgDoc.width, imgDoc.height);
+  ctx.clip();
+  ctx.clearRect(0, 0, imgDoc.width, imgDoc.height);
+  ctx.fillStyle = imgChecker;
+  ctx.fillRect(0, 0, imgDoc.width, imgDoc.height);
+  imgDoc.layers.forEach(function(l) { drawLayer(ctx, l, 1); });
+  ctx.restore();
+
+  // Selection frame and handles in screen pixels, so they keep their size at any zoom
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const sel = selectedLayer();
+  const g = sel ? layerGeometry(sel) : null;
+  if (g)
+  {
+    const pts = g.corners.map(function(p) { return docToScreen(p.x, p.y); });
+    const knob = rotateKnob(g);
+    const top = docToScreen(g.topMid.x, g.topMid.y);
+    ctx.strokeStyle = '#2563eb';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (var i = 1; i < 4; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.closePath();
+    ctx.moveTo(top.x, top.y);
+    ctx.lineTo(knob.x, knob.y);
+    ctx.stroke();
+    ctx.fillStyle = '#ffffff';
+    pts.forEach(function(p) { ctx.fillRect(p.x - 5, p.y - 5, 10, 10); ctx.strokeRect(p.x - 5, p.y - 5, 10, 10); });
+    ctx.beginPath();
+    ctx.arc(knob.x, knob.y, 6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  }
+  updateImageInfo();
+}
+
+function updateImageInfo()
+{
+  const info = document.getElementById('image-info');
+  if (info && imgDoc) info.textContent = imgDoc.width + '×' + imgDoc.height + ' · ' + imgDoc.layers.length + (imgDoc.layers.length === 1 ? ' layer' : ' layers') + ' · ' + Math.round(imgView.scale * 100) + '%';
+}
+
+function layerContains(layer, p)
+{
+  const g = layerGeometry(layer);
+  if (!g) return false;
+  const dx = p.x - layer.x;
+  const dy = p.y - layer.y;
+  const lx = dx * g.cos + dy * g.sin;
+  const ly = -dx * g.sin + dy * g.cos;
+  return Math.abs(lx) <= g.hw && Math.abs(ly) <= g.hh;
+}
+
+// Handles of the selected layer first, then the topmost visible layer under the point, else panning
+function imageHitTest(sx, sy)
+{
+  const sel = selectedLayer();
+  const g = sel ? layerGeometry(sel) : null;
+  if (g)
+  {
+    const knob = rotateKnob(g);
+    if (Math.hypot(sx - knob.x, sy - knob.y) <= IMAGE_HANDLE_RADIUS) return { mode: 'rotate', layer: sel };
+    for (var i = 0; i < 4; i++)
+    {
+      const c = docToScreen(g.corners[i].x, g.corners[i].y);
+      if (Math.hypot(sx - c.x, sy - c.y) <= IMAGE_HANDLE_RADIUS) return { mode: 'scale', layer: sel };
+    }
+  }
+  const p = screenToDoc(sx, sy);
+  for (var j = imgDoc.layers.length - 1; j >= 0; j--)
+  {
+    const l = imgDoc.layers[j];
+    if (l.visible !== false && layerContains(l, p)) return { mode: 'move', layer: l };
+  }
+  return { mode: 'pan', layer: null };
+}
+
+function onImagePointerDown(e)
+{
+  if (!imgDoc) return;
+  const canvas = e.currentTarget;
+  const rect = canvas.getBoundingClientRect();
+  const sx = e.clientX - rect.left;
+  const sy = e.clientY - rect.top;
+  const hit = imageHitTest(sx, sy);
+  imgSelectedId = hit.layer ? hit.layer.id : null;
+  const l = hit.layer;
+  imgDrag = { mode: hit.mode, sx: sx, sy: sy, x: l ? l.x : 0, y: l ? l.y : 0, scale: l ? (l.scale || 1) : 1, rotation: l ? (l.rotation || 0) : 0, ox: imgView.ox, oy: imgView.oy, changed: false };
+  canvas.setPointerCapture(e.pointerId);
+  e.preventDefault();
+  renderImageCanvas();
+  renderLayerPanel();
+}
+
+function onImagePointerMove(e)
+{
+  if (!imgDrag) return;
+  const rect = e.currentTarget.getBoundingClientRect();
+  const sx = e.clientX - rect.left;
+  const sy = e.clientY - rect.top;
+  const sel = selectedLayer();
+  if (imgDrag.mode === 'pan')
+  {
+    imgView.ox = imgDrag.ox + (sx - imgDrag.sx);
+    imgView.oy = imgDrag.oy + (sy - imgDrag.sy);
+  }
+  else if (sel && imgDrag.mode === 'move')
+  {
+    sel.x = imgDrag.x + (sx - imgDrag.sx) / imgView.scale;
+    sel.y = imgDrag.y + (sy - imgDrag.sy) / imgView.scale;
+    imgDrag.changed = true;
+  }
+  else if (sel && imgDrag.mode === 'scale')
+  {
+    const c = docToScreen(imgDrag.x, imgDrag.y);
+    const d0 = Math.hypot(imgDrag.sx - c.x, imgDrag.sy - c.y);
+    const d1 = Math.hypot(sx - c.x, sy - c.y);
+    if (d0 > 0) sel.scale = Math.max(0.02, imgDrag.scale * d1 / d0);
+    imgDrag.changed = true;
+  }
+  else if (sel && imgDrag.mode === 'rotate')
+  {
+    const c = docToScreen(imgDrag.x, imgDrag.y);
+    const a0 = Math.atan2(imgDrag.sy - c.y, imgDrag.sx - c.x);
+    const a1 = Math.atan2(sy - c.y, sx - c.x);
+    let deg = imgDrag.rotation + (a1 - a0) * 180 / Math.PI;
+    if (e.shiftKey) deg = Math.round(deg / 15) * 15;
+    deg = ((deg + 180) % 360 + 360) % 360 - 180;
+    sel.rotation = deg;
+    imgDrag.changed = true;
+  }
+  renderImageCanvas();
+}
+
+function onImagePointerUp(e)
+{
+  if (!imgDrag) return;
+  if (imgDrag.changed) scheduleImageSave();
+  imgDrag = null;
+  renderLayerPanel();
+}
+
+// Layer list, top layer first
+function renderLayerPanel()
+{
+  const panel = document.getElementById('layer-panel');
+  if (!panel) return;
+  panel.innerHTML = '';
+  if (!imgDoc) return;
+  const count = imgDoc.layers.length;
+  for (let i = count - 1; i >= 0; i--)
+  {
+    const layer = imgDoc.layers[i];
+    const row = document.createElement('div');
+    row.className = 'layer-row' + (layer.id === imgSelectedId ? ' selected' : '') + (layer.visible === false ? ' layer-off' : '');
+
+    const eye = document.createElement('button');
+    eye.className = 'layer-btn';
+    eye.textContent = layer.visible === false ? '◌' : '👁';
+    eye.title = layer.visible === false ? 'Show layer' : 'Hide layer';
+    eye.onclick = function(e) { e.stopPropagation(); layer.visible = layer.visible === false; afterLayerChange(); };
+
+    const name = document.createElement('span');
+    name.className = 'layer-name';
+    name.textContent = (imgCache[layerFilePath(layer)] === null ? '⚠ ' : '') + (layer.name || layer.src);
+    name.title = layerFilePath(layer);
+
+    const up = document.createElement('button');
+    up.className = 'layer-btn';
+    up.textContent = '▲';
+    up.title = 'Move up';
+    up.disabled = i === count - 1;
+    up.onclick = function(e) { e.stopPropagation(); swapLayers(i, i + 1); };
+
+    const down = document.createElement('button');
+    down.className = 'layer-btn';
+    down.textContent = '▼';
+    down.title = 'Move down';
+    down.disabled = i === 0;
+    down.onclick = function(e) { e.stopPropagation(); swapLayers(i, i - 1); };
+
+    const del = document.createElement('button');
+    del.className = 'layer-btn';
+    del.textContent = '✕';
+    del.title = 'Remove layer';
+    del.disabled = count === 1;
+    del.onclick = function(e)
+    {
+      e.stopPropagation();
+      showConfirm('Remove layer "' + (layer.name || layer.src) + '" from this image? Its file stays on disk.', function()
+      {
+        imgDoc.layers = imgDoc.layers.filter(function(l) { return l !== layer; });
+        if (imgSelectedId === layer.id) imgSelectedId = null;
+        afterLayerChange();
+      }, 'Remove');
+    };
+
+    row.onclick = function() { imgSelectedId = layer.id; renderImageCanvas(); renderLayerPanel(); };
+    row.appendChild(eye);
+    row.appendChild(name);
+    row.appendChild(up);
+    row.appendChild(down);
+    row.appendChild(del);
+    panel.appendChild(row);
+  }
+}
+
+function swapLayers(a, b)
+{
+  const t = imgDoc.layers[a];
+  imgDoc.layers[a] = imgDoc.layers[b];
+  imgDoc.layers[b] = t;
+  afterLayerChange();
+}
+
+function afterLayerChange()
+{
+  renderImageCanvas();
+  renderLayerPanel();
+  scheduleImageSave();
+}
+
+function addLayerObject(props, img)
+{
+  const scale = Math.min(1, imgDoc.width / img.naturalWidth, imgDoc.height / img.naturalHeight);
+  const layer = Object.assign({ id: 'l' + Date.now(), x: imgDoc.width / 2, y: imgDoc.height / 2, scale: scale, rotation: 0, opacity: 1, visible: true }, props);
+  imgDoc.layers.push(layer);
+  imgSelectedId = layer.id;
+  afterLayerChange();
+}
+
+// Tree menu "Add as Layer": a sibling is referenced by name, anything else by its full path
+function addLayerFromPath(path, name)
+{
+  if (!imgDoc || !imgUrl) return;
+  const img = new Image();
+  img.onload = function()
+  {
+    imgCache[path] = img;
+    if (pathDir(path) === pathDir(imgUrl)) addLayerObject({ src: pathName(path), name: name }, img);
+    else addLayerObject({ url: path, src: pathName(path), name: name }, img);
+  };
+  img.onerror = function() { showNotification('Cannot load ' + name); };
+  img.src = imageUrlFor(path);
+}
+
+function imageToPngBlob(img, callback)
+{
+  const c = document.createElement('canvas');
+  c.width = img.naturalWidth || 512;
+  c.height = img.naturalHeight || 512;
+  c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+  c.toBlob(callback, 'image/png');
+}
+
+// "+ Layer": a picture from this device, stored as PNG in "<image>.layers/"
+function uploadLayerFile(input)
+{
+  const file = input.files && input.files[0];
+  input.value = '';
+  if (!file || !imgDoc || !imgUrl) return;
+  const baseUrl = imgUrl;
+  const objectUrl = URL.createObjectURL(file);
+  const img = new Image();
+  img.onload = function()
+  {
+    URL.revokeObjectURL(objectUrl);
+    imageToPngBlob(img, function(blob)
+    {
+      const stem = file.name.replace(/\.[^.]+$/, '').replace(/[^A-Za-z0-9._-]+/g, '-') || 'layer';
+      const rel = pathName(baseUrl) + '.layers/' + stem + '-' + fileTimestamp() + '.png';
+      const target = siblingPath(baseUrl, rel);
+      uploadBytes(target, blob, 'layer.png', function(ok)
+      {
+        if (!ok || imgUrl !== baseUrl) return;
+        imgCache[target] = img;
+        addLayerObject({ src: rel, name: file.name }, img);
+        refreshTreeExplorer();
+      });
+    });
+  };
+  img.onerror = function() { URL.revokeObjectURL(objectUrl); showNotification('Cannot read ' + file.name); };
+  img.src = objectUrl;
+}
+
+// "Merge ⇩": every visible layer flattened into one new PNG; the layers themselves stay as they are
+function mergeLayers()
+{
+  if (!imgDoc || !imgUrl) return;
+  const baseUrl = imgUrl;
+  const c = document.createElement('canvas');
+  c.width = imgDoc.width;
+  c.height = imgDoc.height;
+  const ctx = c.getContext('2d');
+  imgDoc.layers.forEach(function(l) { drawLayer(ctx, l, 1); });
+  c.toBlob(function(blob)
+  {
+    const target = siblingPath(baseUrl, pathName(baseUrl).replace(/\.[^.]+$/, '') + '-merged-' + fileTimestamp() + '.png');
+    uploadBytes(target, blob, 'merged.png', function(ok)
+    {
+      if (!ok) return;
+      showNotification('Saved ' + pathName(target));
+      refreshTreeExplorer();
+    });
+  }, 'image/png');
+}
+
+// Multipart upload to the imagesave command; the callback receives true on success
+function uploadBytes(path, blob, filename, callback)
+{
+  const form = new FormData();
+  form.append('ajaxcall', '1');
+  form.append('file', blob, filename);
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/imagesave/' + encodePath(path), true);
+  xhr.onreadystatechange = function()
+  {
+    if (xhr.readyState !== 4) return;
+    let ok = false;
+    try
+    {
+      const r = xhr.responseXML.getElementsByTagName('result');
+      ok = r.length > 0 && r.item(0).textContent === 'ok';
+    } catch (e) {}
+    if (xhr.status === 200 && xhr.responseXML) alertContents(xhr);
+    else showNotification('Upload failed (' + xhr.status + ')');
+    if (typeof callback === 'function') callback(ok);
+  };
+  xhr.send(form);
+}
+
+function scheduleImageSave()
+{
+  if (!imgDoc || !imgUrl) return;
+  if (imgSaveTimer) clearTimeout(imgSaveTimer);
+  setSaveStatus('unsaved');
+  imgSaveTimer = setTimeout(function() { imgSaveTimer = null; saveImageDoc(); }, 800);
+}
+
+// Saves a pending layer change now; the callback runs once nothing is left to save
+function flushImageSave(callback)
+{
+  if (imgSaveTimer)
+  {
+    clearTimeout(imgSaveTimer);
+    imgSaveTimer = null;
+    saveImageDoc(callback);
+    return;
+  }
+  if (imgSaving)
+  {
+    if (typeof callback === 'function') imgSaveWaiters.push(callback);
+    return;
+  }
+  if (typeof callback === 'function') callback();
+}
+
+function saveImageDoc(callback)
+{
+  if (typeof callback === 'function') imgSaveWaiters.push(callback);
+  if (!imgDoc || !imgUrl)
+  {
+    drainImageWaiters();
+    return;
+  }
+  const url = imgUrl;
+  const doc = imgDoc;
+  imgSaving = true;
+  setSaveStatus('saving');
+  ensureServerReadable(doc, url, function()
+  {
+    uploadBytes(url + '.layers.json', new Blob([JSON.stringify(doc)], { type: 'application/json' }), 'layers.json', function(ok)
+    {
+      imgSaving = false;
+      if (imgUrl === url) setSaveStatus(ok ? 'saved' : 'unsaved');
+      drainImageWaiters();
+    });
+  });
+}
+
+function drainImageWaiters()
+{
+  const waiters = imgSaveWaiters;
+  imgSaveWaiters = [];
+  waiters.forEach(function(f) { f(); });
+}
+
+// The server composes layers with ImageIO, which cannot read WebP, AVIF or SVG: those layers are
+// converted to PNG copies in "<image>.layers/" before the layer file is written
+function ensureServerReadable(doc, url, done)
+{
+  const pending = doc.layers.filter(function(l) { return IMAGE_SERVER_READABLE.indexOf(pathExt(layerFilePath(l, url))) === -1 && imgCache[layerFilePath(l, url)]; });
+  if (pending.length === 0) { done(); return; }
+  const layer = pending[0];
+  const oldPath = layerFilePath(layer, url);
+  const img = imgCache[oldPath];
+  const rel = pathName(url) + '.layers/' + pathName(oldPath).replace(/\.[^.]+$/, '') + '-' + fileTimestamp() + '.png';
+  imageToPngBlob(img, function(blob)
+  {
+    uploadBytes(siblingPath(url, rel), blob, 'layer.png', function(ok)
+    {
+      // On failure the layer keeps its original file: the viewer still shows it, only AI edits cannot use it
+      if (!ok) { done(); return; }
+      delete layer.url;
+      layer.src = rel;
+      imgCache[layerFilePath(layer, url)] = img;
+      ensureServerReadable(doc, url, done);
+    });
+  });
 }

@@ -63,6 +63,13 @@ public class SaveBean extends BeanObject
 
     String subPath = path.getSuffix();
     if (subPath.isEmpty()) return;
+    // Text autosave must never land on an image: those are written only by the image viewer (imagesave)
+    if (ing.aether.tools.ai.ImageWorker.isImagePath(subPath))
+    {
+      success = false;
+      message = "Not saved: images are saved by the image viewer, not as text";
+      return;
+    }
 
     int receivedSize = content != null ? content.length() : 0;
 

@@ -249,6 +249,19 @@ public class GoogleDriveProvider implements FileProvider
     pathCache.clear();
   }
 
+  // New images get their real type: labelled text/plain, Drive shows a PNG as a broken text file
+  private static String mimeForNewFile(String name)
+  {
+    String lower = name.toLowerCase();
+    if (lower.endsWith(".png")) return "image/png";
+    if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+    if (lower.endsWith(".gif")) return "image/gif";
+    if (lower.endsWith(".webp")) return "image/webp";
+    if (lower.endsWith(".bmp")) return "image/bmp";
+    if (lower.endsWith(".svg")) return "image/svg+xml";
+    return "text/plain";
+  }
+
   @Override
   public InputStream getInputStream(String path) throws Exception
   {
@@ -286,7 +299,7 @@ public class GoogleDriveProvider implements FileProvider
             String name = path.substring(lastSlash + 1);
             String parentPath = lastSlash <= 0 ? "" : path.substring(0, lastSlash);
             String parentId = assertIsFolder(parentPath);
-            drive.createFileWithContent(name, "text/plain", parentId, this.toByteArray());
+            drive.createFileWithContent(name, mimeForNewFile(name), parentId, this.toByteArray());
             idCache.clear();
             pathCache.clear();
           } 

@@ -9,6 +9,8 @@ public class Agent
   private String prompt;
   private List<String> tools;
   private List<AgentCommand> commands;
+  // Image agents also drive an image model: the UI shows the image model selector and controls
+  private boolean image;
 
   public String getId() { return id; }
   public void setId(String id) { this.id = id; }
@@ -20,4 +22,6 @@ public class Agent
   public void setTools(List<String> tools) { this.tools = tools; }
   public List<AgentCommand> getCommands() { return commands; }
   public void setCommands(List<AgentCommand> commands) { this.commands = commands; }
+  public boolean isImage() { return image; }
+  public void setImage(boolean image) { this.image = image; }
 }

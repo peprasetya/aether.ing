@@ -15,11 +15,21 @@
     <% } %>
   </select>
 </replacehtml>
+<%-- Text models drive the chat; image models only the image tools, and onAgentChange shows that
+     second select for image agents. Embedding models belong in neither and are left out --%>
 <replacehtml id="ai-selectors">
   <select id="model-select" class="model-select">
-    <% for (String model : bean.getModels()) {
+    <% for (String model : ing.aether.tools.ai.LlmProviders.filterKind(bean.getModels(), ing.aether.tools.ai.LlmProviders.KindText)) {
       int sepIdx = model.indexOf("::");
       String label = sepIdx > 0 ? "[" + model.substring(0, sepIdx) + "] " + model.substring(sepIdx + 2) : model;
+    %>
+      <option value="<%= model %>"><%= label %></option>
+    <% } %>
+  </select>
+  <select id="image-model-select" class="model-select hidden" title="Image model">
+    <% for (String model : ing.aether.tools.ai.LlmProviders.filterKind(bean.getModels(), ing.aether.tools.ai.LlmProviders.KindImage)) {
+      int sepIdx = model.indexOf("::");
+      String label = sepIdx > 0 ? "🖼️ [" + model.substring(0, sepIdx) + "] " + model.substring(sepIdx + 2) : "🖼️ " + model;
     %>
       <option value="<%= model %>"><%= label %></option>
     <% } %>

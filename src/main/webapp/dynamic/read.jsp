@@ -2,7 +2,13 @@
 <ajax>
   <replacehtml id="current-filename"><%=bean.getFileName()%></replacehtml>
   <replacehtml id="file-content-buffer"><%=bean.getFileContent()%></replacehtml>
+<% if (bean.isImage()) { %>
+  <script id="loadScript">
+    openImageViewer();
+  </script>
+<% } else { %>
   <script id="loadScript">
     updateEditorFromBuffer();
   </script>
+<% } %>
 </ajax>

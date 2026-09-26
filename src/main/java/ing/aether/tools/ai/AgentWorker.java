@@ -66,6 +66,15 @@ public class AgentWorker
   private static final Set<String> todoRejectedTurn = ConcurrentHashMap.newKeySet();
   private static final int MAX_TODO_NUDGES = 2;
 
+  // Non-chatlog commands leave a short trail in the chat session so a result produced while the user
+  // was away survives a reload. The entry is opened when the command starts and completed by whichever
+  // path ends the turn; the model never sees these entries (streamOllama skips them)
+  private static final Map<String, Map<String, Object>> pendingCommands = new ConcurrentHashMap<>();
+  private static final int MAX_COMMAND_ENTRIES = 3;
+
+  // Flattened canvas attached to this turn's user message for vision-capable models (image agents)
+  private static final Map<String, String> turnImages = new ConcurrentHashMap<>();
+
   public static void handlePermission(String httpSessionId, boolean granted)
   {
     handlePermission(httpSessionId, granted, null);
@@ -110,6 +119,8 @@ public class AgentWorker
       System.out.println("AgentWorker: Interrupting AI task for session " + httpSessionId);
       t.interrupt();
     }
+    // An image run holds the GPU for minutes: tell the image server to stop, not just our thread
+    ImageWorker.cancel(httpSessionId);
     // Close the response stream: a thread blocked in readLine() does not react to interrupt
     InputStream s = activeAiStreams.remove(httpSessionId);
     if (s != null) try { s.close(); } catch (Exception ignore) {}
@@ -156,6 +167,57 @@ public class AgentWorker
     }
   }
 
+  // Progress line under the chat. Unbuffered: after a reconnect only the next stage matters, not a replay of old ones
+  public static void sendStatus(String httpSessionId, String stage, String text)
+  {
+    sendStatus(httpSessionId, stage, text, null);
+  }
+
+  public static void sendStatus(String httpSessionId, String stage, String text, Map<String, Object> extra)
+  {
+    Map<String, Object> m = new HashMap<>();
+    if (extra != null) m.putAll(extra);
+    m.put("type", "chat_status");
+    m.put("stage", stage);
+    m.put("text", text);
+    AetherWebSocket.sendToSession(httpSessionId, m, false);
+  }
+
+  // Appends a finished command to the chat session and keeps only the newest MAX_COMMAND_ENTRIES of them
+  @SuppressWarnings("unchecked")
+  private static void recordCommand(HttpSession session, Map<String, Object> entry)
+  {
+    List<Map<String, Object>> history = (List<Map<String, Object>>) session.getAttribute("chatHistory");
+    if (history == null)
+    {
+      history = new ArrayList<>();
+      session.setAttribute("chatHistory", history);
+    }
+    entry.put("doneTime", System.currentTimeMillis());
+    history.add(entry);
+    int count = 0;
+    for (Map<String, Object> m : history) if ("command".equals(m.get("role"))) count++;
+    for (Iterator<Map<String, Object>> it = history.iterator(); it.hasNext() && count > MAX_COMMAND_ENTRIES;)
+    {
+      if ("command".equals(it.next().get("role")))
+      {
+        it.remove();
+        count--;
+      }
+    }
+    saveChatSession(session, history);
+  }
+
+  // Completes the pending command entry of this turn, if any, with its result or failure
+  private static void finishCommand(HttpSession session, String httpSessionId, String content, String error)
+  {
+    Map<String, Object> entry = pendingCommands.remove(httpSessionId);
+    if (entry == null) return;
+    if (content != null) entry.put("content", content);
+    if (error != null) entry.put("error", error);
+    try { recordCommand(session, entry); } catch (Exception e) { System.out.println("WARN: command trail not saved: " + e.getMessage()); }
+  }
+
   public static void loadAgents(String webInfPath)
   {
     File dir = new File(webInfPath, "agents");
@@ -176,6 +238,7 @@ public class AgentWorker
         agent.setId((String) map.get("id"));
         agent.setName((String) map.get("name"));
         agent.setPrompt((String) map.get("prompt"));
+        agent.setImage(Boolean.TRUE.equals(map.get("image")));
         
         Object toolsObj = map.get("tools");
         if (toolsObj instanceof Object[]) agent.setTools(Arrays.asList(Arrays.copyOf((Object[])toolsObj, ((Object[])toolsObj).length, String[].class)));
@@ -200,6 +263,7 @@ public class AgentWorker
               cmd.setChatlog(Boolean.TRUE.equals(cMap.get("chatlog")));
               cmd.setResponse((String) cMap.get("response"));
               cmd.setTarget((String) cMap.get("target"));
+              cmd.setMode((String) cMap.get("mode"));
               commands.add(cmd);
             }
             agent.setCommands(commands);
@@ -276,7 +340,15 @@ public class AgentWorker
       }
     }
 
+    // Direct image commands never involve the chat model: the prompt goes straight to the image model
+    if (cmd != null && "image".equals(cmd.getResponse()))
+    {
+      runImageCommand(session, realAgentId, cmd, userMessage);
+      return;
+    }
+
     // Prepare context
+    sendStatus(session.getId(), "preparing", describePreparation(session, contextFiles));
     Map<String, String> contextMap = buildContextMap(session, contextFiles, selectedText);
     contextMap.put("USER_INPUT", (userMessage == null || userMessage.isEmpty()) ? "(User does not give input, you can decide by your own)" : userMessage);
     // Build rich System Prompt
@@ -344,6 +416,9 @@ public class AgentWorker
 
     if (contextMap.containsKey("CONTEXT_FILES")) sbContext.append("\n\nChecked files:\n").append(contextMap.get("CONTEXT_FILES"));
 
+    // The image tools default to what the user set in the chat pane; the model sees it so it can reason about cost
+    if (agent.isImage()) sbContext.append("\n\n").append(describeImageSettings(session));
+
     // Rewritten by the psychologist on almost every turn, so it sits last, behind the open file
     String personality = contextMap.get("USER_PERSONALITY");
     if (personality != null && !personality.isEmpty()) sbContext.append("\n\nUser Personality Profile (background only — adapt your tone to match it; never quote, summarise or discuss this profile):\n").append(personality);
@@ -374,6 +449,35 @@ public class AgentWorker
     }
 
     // Pass the EXPANDED prompt to Ollama, but history contains CLEAN messages
+
+    // Opened now, completed by whichever path ends the turn; a stopped command is simply never completed
+    pendingCommands.remove(session.getId());
+    if (cmd != null && !useHistory)
+    {
+      Map<String, Object> entry = new HashMap<>();
+      entry.put("role", "command");
+      entry.put("time", System.currentTimeMillis());
+      entry.put("label", cmd.getLabel());
+      entry.put("commandId", cmd.getId());
+      entry.put("agent", realAgentId);
+      entry.put("input", userMessage == null ? "" : userMessage);
+      entry.put("responseType", responseType);
+      if (responseTarget != null) entry.put("target", responseTarget);
+      entry.put("model", model);
+      pendingCommands.put(session.getId(), entry);
+    }
+
+    // Image agents look at the canvas through a vision-capable chat model when the user allows it
+    turnImages.remove(session.getId());
+    if (agent.isImage() && !"false".equals(String.valueOf(imageParams(session).get("vision"))))
+    {
+      String openFile = (String) session.getAttribute("lastFilePath");
+      if (ImageWorker.isImagePath(openFile))
+      {
+        String dataUrl = ImageWorker.canvasDataUrl(session, openFile);
+        if (dataUrl != null) turnImages.put(session.getId(), dataUrl);
+      }
+    }
 
     // Persist AI config transparently (non-blocking, Google Drive API may be slow)
     final String persistAgentId = realAgentId;
@@ -417,6 +521,104 @@ public class AgentWorker
     int max = 16384;
     if (s.length() <= max) return s;
     return s.substring(0, 2048) + "\n[... " + (s.length() - max) + " chars truncated ...]\n" + s.substring(s.length() - (max - 2048));
+  }
+
+  private static String describePreparation(HttpSession session, List<String> contextFiles)
+  {
+    List<String> parts = new ArrayList<>();
+    if (session.getAttribute("workingDirectory") != null) parts.add("AGENTS.md");
+    String openFile = (String) session.getAttribute("lastFilePath");
+    if (openFile != null) parts.add(ImageWorker.nameOf(openFile));
+    if (contextFiles != null && !contextFiles.isEmpty()) parts.add(contextFiles.size() + (contextFiles.size() == 1 ? " checked file" : " checked files"));
+    return parts.isEmpty() ? "Preparing request…" : "Reading " + String.join(", ", parts) + "…";
+  }
+
+  // Image settings from the chat pane, sent with every chat message (see AetherWebSocket)
+  @SuppressWarnings("unchecked")
+  private static Map<String, Object> imageParams(HttpSession session)
+  {
+    Object p = session.getAttribute("imageParams");
+    return p instanceof Map ? (Map<String, Object>) p : new HashMap<>();
+  }
+
+  private static String describeImageSettings(HttpSession session)
+  {
+    Map<String, Object> p = imageParams(session);
+    Object model = session.getAttribute("imageModel");
+    return "Image settings chosen by the user (defaults for generateImage/editImage): image model " + (model != null ? model : "none selected")
+      + ", size " + p.getOrDefault("size", "auto") + ", steps " + p.getOrDefault("steps", 14)
+      + ", transparent background " + ("true".equals(String.valueOf(p.get("transparent"))) ? "on" : "off")
+      + ", edit source " + p.getOrDefault("source", "canvas") + ".";
+  }
+
+  // A direct image command (agent command with "response": "image"): one run on the image model,
+  // with the same working-state, status, stop and command-trail behaviour as a chat turn
+  private static void runImageCommand(HttpSession session, String agentId, AgentCommand cmd, String userMessage)
+  {
+    final String httpSessionId = session.getId();
+    String imageModel = (String) session.getAttribute("imageModel");
+    Map<String, Object> params = new HashMap<>(imageParams(session));
+    params.put("mode", "edit".equals(cmd.getMode()) ? "edit" : "generate");
+    Map<String, String> ctx = new HashMap<>();
+    ctx.put("USER_INPUT", userMessage == null ? "" : userMessage);
+    params.put("prompt", expandPrompt(cmd.getPrompt(), ctx));
+
+    Map<String, Object> entry = new HashMap<>();
+    entry.put("role", "command");
+    entry.put("time", System.currentTimeMillis());
+    entry.put("label", cmd.getLabel());
+    entry.put("commandId", cmd.getId());
+    entry.put("agent", agentId);
+    entry.put("input", userMessage == null ? "" : userMessage);
+    entry.put("responseType", "image");
+    entry.put("model", imageModel);
+    pendingCommands.put(httpSessionId, entry);
+
+    CompletableFuture.runAsync(() ->
+    {
+      activeAiThreads.put(httpSessionId, Thread.currentThread());
+      long start = System.nanoTime();
+      try
+      {
+        Map<String, Object> result = ImageWorker.run(session, httpSessionId, imageModel, params);
+        finishCommand(session, httpSessionId, String.valueOf(result.get("path")), null);
+        Map<String, Object> done = new HashMap<>();
+        done.put("type", "chat_done");
+        done.put("responseType", "image");
+        done.put("total_duration", System.nanoTime() - start);
+        if (AetherWebSocket.sendToSession(httpSessionId, done)) AetherWebSocket.clearBuffer(httpSessionId);
+      }
+      catch (Exception e)
+      {
+        boolean stopped = Thread.currentThread().isInterrupted() || e instanceof InterruptedException;
+        if (stopped) pendingCommands.remove(httpSessionId);
+        else
+        {
+          finishCommand(session, httpSessionId, null, e.getMessage());
+          AetherWebSocket.sendToSession(httpSessionId, Map.of("type", "chat_error", "error", "Image: " + e.getMessage()));
+        }
+      }
+      finally
+      {
+        activeAiThreads.remove(httpSessionId, Thread.currentThread());
+      }
+    });
+  }
+
+  // Tool entry point for generateImage / editImage: the model's arguments override the user's pane settings
+  private static String runImageTool(HttpSession session, String httpSessionId, String name, Map<String, Object> args) throws Exception
+  {
+    Map<String, Object> params = new HashMap<>(imageParams(session));
+    for (String k : new String[] { "prompt", "size", "steps", "transparent", "source", "layers", "name" }) if (args.get(k) != null) params.put(k, args.get(k));
+    params.put("mode", "editImage".equals(name) ? "edit" : "generate");
+    Map<String, Object> r = ImageWorker.run(session, httpSessionId, (String) session.getAttribute("imageModel"), params);
+    String rel = AITools.resolveRelativePath(session, String.valueOf(r.get("path")));
+    StringBuilder sb = new StringBuilder();
+    sb.append("Image ").append("editImage".equals(name) ? "edited" : "generated").append(" in ").append(ImageWorker.formatDuration(((Number) r.get("seconds")).longValue()));
+    sb.append(" and saved as ").append(rel).append(" (").append(r.get("width")).append("x").append(r.get("height")).append(").");
+    if (r.get("layer") != null) sb.append(" It was added as the new top layer \"").append(((Map<?, ?>) r.get("layer")).get("name")).append("\" of the open image.");
+    else sb.append(" It is shown to the user in the chat.");
+    return sb.toString();
   }
 
   public static void createNewSession(HttpSession session)
@@ -467,6 +669,8 @@ public class AgentWorker
         if (model != null) config.put("model", model);
         if (thinkingMode != null) config.put("thinking_mode", thinkingMode);
         if (agentId != null) config.put("agent_id", agentId);
+        Object imageModel = session.getAttribute("imageModel");
+        if (imageModel != null) config.put("image_model", imageModel);
       });
     } catch (Exception e) { e.printStackTrace(); }
   }
@@ -484,6 +688,8 @@ public class AgentWorker
       Object model = config.get("model");
       Object thinkingMode = config.get("thinking_mode");
       Object agentId = config.get("agent_id");
+      Object imageModel = config.get("image_model");
+      if (imageModel != null) result.put("image_model", imageModel.toString());
       // Configs saved before multi-provider support hold bare model ids; qualify them so
       // they keep matching the dropdown options, which are always "Provider::model"
       if (model != null) result.put("model", LlmProviders.qualify(model.toString()));
@@ -1010,7 +1216,14 @@ public class AgentWorker
     }
 
     String activeFile = (String) session.getAttribute("lastFilePath");
-    if (activeFile != null)
+    // An open image is described, never read: its bytes decoded as UTF-8 are noise that can run to megabytes
+    if (activeFile != null && ImageWorker.isImagePath(activeFile))
+    {
+      String rel = AITools.resolveRelativePath(session, activeFile);
+      context.put("CONTENT", ImageWorker.describe(session, activeFile, rel));
+      context.put("RELATIVE_PATH", rel);
+    }
+    else if (activeFile != null)
     {
        try
        {
@@ -1026,6 +1239,11 @@ public class AgentWorker
        StringBuilder sb = new StringBuilder();
        for (String f : contextFiles)
        {
+         if (ImageWorker.isImagePath(f))
+         {
+           sb.append("\n--- FILE: ").append(AITools.resolveRelativePath(session, f)).append(" ---\n[image file: its pixels are not sent as text]\n");
+           continue;
+         }
          try {
            String content = AITools.readFile(session, f);
            sb.append("\n--- FILE: ").append(AITools.resolveRelativePath(session, f)).append(" ---\n").append(content).append("\n");
@@ -1083,6 +1301,7 @@ public class AgentWorker
         if (rounds > MAX_ROUNDS)
         {
           AetherWebSocket.sendToSession(httpSessionId, Map.of("type", "chat_error", "error", "Round limit (" + MAX_ROUNDS + ") reached — stopping the tool loop to protect against a runaway turn."));
+          finishCommand(session, httpSessionId, null, "Round limit reached");
           AetherWebSocket.sendToSession(httpSessionId, Map.of("type", "chat_done", "responseType", responseType != null ? responseType : "chat"));
           return;
         }
@@ -1093,6 +1312,7 @@ public class AgentWorker
         if (target == null)
         {
           AetherWebSocket.sendToSession(httpSessionId, Map.of("type", "chat_error", "error", "No LLM provider found for model '" + model + "'. Pick another model, or ask the admin to check the provider list in Settings."));
+          finishCommand(session, httpSessionId, null, "No LLM provider found for model " + model);
           AetherWebSocket.sendToSession(httpSessionId, Map.of("type", "chat_done", "responseType", responseType != null ? responseType : "chat"));
           return;
         }
@@ -1119,6 +1339,8 @@ public class AgentWorker
         for (Map<String, Object> m : history)
         {
           String role = String.valueOf(m.get("role"));
+          // Command trail entries exist for the user's review only: skipping them keeps the prompt byte-identical for the KV cache
+          if ("command".equals(role)) continue;
           Map<String, Object> msg = new HashMap<>();
           msg.put("role", role);
           msg.put("content", m.get("content") != null ? m.get("content") : "");
@@ -1142,6 +1364,13 @@ public class AgentWorker
           userMsg.put("content", userPrompt);
           messages.add(userMsg);
         }
+        // Image agents: the flattened canvas rides on the prompt message, the tail of the request, so the cached prefix is untouched
+        String turnImage = turnImages.get(httpSessionId);
+        if (turnImage != null)
+        {
+          int promptIdx = lastUserIdx >= 0 ? lastUserIdx : messages.size() - 1;
+          messages.get(promptIdx).put("content", Arrays.asList(Map.of("type", "text", "text", userPrompt), Map.of("type", "image_url", "image_url", Map.of("url", turnImage))));
+        }
         request.put("messages", messages);
 
         String jsonRequest = json.toJSON(request);
@@ -1149,12 +1378,17 @@ public class AgentWorker
         {
           StringBuilder index = new StringBuilder();
           for (Map<String, Object> m : messages) index.append("  [").append(m.get("role")).append("] ").append(String.valueOf(m.get("content")).length()).append(" chars\n");
-          System.out.println("=== LLM REQUEST (" + model + ", " + jsonRequest.length() + " chars) ===\n" + index + prettyJson(jsonRequest) + "\n=== END LLM REQUEST ===");
+          System.out.println("=== LLM REQUEST (" + model + ", " + jsonRequest.length() + " chars) ===\n" + index + prettyJson(jsonRequest.replaceAll("data:image/[a-z]+;base64,[A-Za-z0-9+/=\\\\]+", "data:image/...;base64,<omitted>")) + "\n=== END LLM REQUEST ===");
         }
         HttpRequest.Builder reqBuilder = HttpRequest.newBuilder().uri(URI.create(target.url + "/v1/chat/completions")).timeout(java.time.Duration.ofMinutes(5)).header("Content-Type", "application/json").POST(HttpRequest.BodyPublishers.ofString(jsonRequest));
         if (!target.apiKey.isEmpty()) reqBuilder.header("Authorization", "Bearer " + target.apiKey);
         HttpRequest httpRequest = reqBuilder.build();
 
+        long promptChars = 0;
+        for (Map<String, Object> m : messages) if (m.get("content") instanceof String) promptChars += ((String) m.get("content")).length();
+        sendStatus(httpSessionId, "sending", (rounds > 1 ? "Sending tool results to " : "Sending to ") + target.model + " · ~" + approxTokens(promptChars) + " tokens");
+        // Time to first token counts from here: prompt upload, queueing and prompt evaluation included
+        long sentNanos = System.nanoTime();
         HttpResponse<InputStream> response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofInputStream());
         if (response.statusCode() != 200)
         {
@@ -1165,9 +1399,11 @@ public class AgentWorker
           errorMsg.put("type", "chat_error");
           errorMsg.put("error", "HTTP Error " + response.statusCode() + (errBody.isEmpty() ? "" : ": " + errBody));
           AetherWebSocket.sendToSession(httpSessionId, errorMsg);
+          finishCommand(session, httpSessionId, null, "HTTP Error " + response.statusCode());
           return;
         }
 
+        sendStatus(httpSessionId, "waiting", "Processing the prompt · waiting for the first token");
         bodyStream = response.body();
         activeAiStreams.put(httpSessionId, bodyStream);
 
@@ -1178,8 +1414,9 @@ public class AgentWorker
 
         // Incremental tool-call assembly: call index -> {id, name, args (JSON string fragments)}
         LinkedHashMap<String, Map<String, Object>> toolAccum = new LinkedHashMap<>();
-        long startNanos = System.nanoTime();
         long firstTokenNanos = 0;
+        long ttftMs = 0;
+        String lastStage = null;
         long promptTokens = 0, completionTokens = 0;
         String modelName = model;
         boolean streamDone = false;
@@ -1208,6 +1445,7 @@ public class AgentWorker
               errorMsg.put("type", "chat_error");
               errorMsg.put("error", String.valueOf(part.get("error")));
               AetherWebSocket.sendToSession(httpSessionId, errorMsg);
+              finishCommand(session, httpSessionId, null, String.valueOf(part.get("error")));
               return;
             }
 
@@ -1225,7 +1463,15 @@ public class AgentWorker
             Map<String, Object> choice = (Map<String, Object>) choices[0];
             Map<String, Object> delta = (Map<String, Object>) choice.get("delta");
             if (delta == null) continue;
-            if (firstTokenNanos == 0) firstTokenNanos = System.nanoTime();
+            // Ollama opens the stream with an empty role-only delta: only a delta that carries text,
+            // reasoning or a tool call counts as the first token
+            boolean carriesToken = delta.get("tool_calls") instanceof Object[];
+            for (String k : new String[] { "content", "reasoning", "reasoning_content", "thinking" }) if (delta.get(k) instanceof String && !((String) delta.get(k)).isEmpty()) carriesToken = true;
+            if (carriesToken && firstTokenNanos == 0)
+            {
+              firstTokenNanos = System.nanoTime();
+              ttftMs = (firstTokenNanos - sentNanos) / 1_000_000;
+            }
 
             // Streamed tool-call fragments: accumulate per index and mirror the text to the chat log
             if (delta.get("tool_calls") instanceof Object[])
@@ -1284,6 +1530,14 @@ public class AgentWorker
             }
 
             if (!chunk.isEmpty()) fullResponse.append(chunk);
+
+            String stage = !chunk.isEmpty() ? "generating" : ((thoughtText != null && !thoughtText.isEmpty()) || isThinking) ? "thinking" : (delta.get("tool_calls") instanceof Object[]) ? "tool" : null;
+            if (stage != null && !stage.equals(lastStage))
+            {
+              lastStage = stage;
+              String label = "generating".equals(stage) ? "Generating" : "thinking".equals(stage) ? "Thinking" : "Writing a tool call";
+              sendStatus(httpSessionId, stage, label + " · " + modelName, Map.of("ttftMs", ttftMs));
+            }
 
             // Send only the unsent portion of the thinking buffer; resending the whole of it grew O(n^2)
             boolean hasVisibleDelta = !chunk.isEmpty() || thinking.length() > thinkingSent;
@@ -1365,7 +1619,8 @@ public class AgentWorker
 
               // Performance metrics: token counts from usage; generation time is wall-clock (first token -> end).
               // The OpenAI-compatible /v1/chat/completions stream reports no prefill/prompt-eval duration, so it is omitted.
-              done.put("total_duration", endNanos - startNanos);
+              done.put("total_duration", endNanos - sentNanos);
+              done.put("ttft_ms", ttftMs);
               done.put("prompt_eval_count", promptTokens);
               done.put("eval_count", completionTokens);
               done.put("eval_duration", firstTokenNanos > 0 ? endNanos - firstTokenNanos : 0);
@@ -1417,6 +1672,9 @@ public class AgentWorker
                 }
               }
 
+              // A non-chatlog command's result joins the short command trail in the chat session
+              finishCommand(session, httpSessionId, fullResponse.toString(), null);
+
               // Reality audit for todo-capable agents: don't let the turn end while items sit
               // in_progress/verify or after an unremedied rejected completion claim — weak models
               // otherwise announce success and stop without having done anything
@@ -1453,6 +1711,7 @@ public class AgentWorker
         if (!stopped)
         {
           e.printStackTrace();
+          finishCommand(session, httpSessionId, null, String.valueOf(e.getMessage()));
           if (AetherWebSocket.sendToSession(httpSessionId, Map.of("type", "chat_error", "error", "Error: " + e.getMessage()))) AetherWebSocket.clearBuffer(httpSessionId);
         }
       } finally {
@@ -1461,6 +1720,13 @@ public class AgentWorker
         activeAiThreads.remove(httpSessionId, Thread.currentThread());
       }
     });
+  }
+
+  // Rough prompt size for the status line: about four characters per token
+  private static String approxTokens(long chars)
+  {
+    long t = chars / 4;
+    return t >= 1000 ? (t / 1000) + "k" : String.valueOf(t);
   }
 
   private static long asLong(Object o)
@@ -1695,6 +1961,26 @@ public class AgentWorker
           properties.put("explain", EXPLAIN_PROP);
           required.add("command");
           break;
+        case "generateImage":
+          function.put("description", "Create a NEW image with the image model. Slow on this server: roughly a minute for 512x512 at 14 steps, and time grows with pixels x steps (1024x1024 at 20 steps is about nine minutes), so agree on the idea first and do not call it repeatedly. The result is saved as a new PNG; when an image is open it also becomes that image's new top layer. Write the prompt in English as a concrete visual description: subject, composition, style, lighting, colours.");
+          properties.put("prompt", Map.of("type", "string", "description", "Detailed visual description of the image to create."));
+          properties.put("size", Map.of("type", "string", "description", "WIDTHxHEIGHT in multiples of 32, e.g. 768x512. Omit to use the user's size setting."));
+          properties.put("steps", Map.of("type", "number", "description", "Diffusion steps, 4-50. Fewer is faster but rougher. Omit to use the user's setting."));
+          properties.put("transparent", Map.of("type", "boolean", "description", "Transparent background, for logos, stickers and cut-out elements meant to be layered."));
+          properties.put("name", Map.of("type", "string", "description", "Short file-name hint, e.g. 'red-fox'."));
+          required.add("prompt");
+          break;
+        case "editImage":
+          function.put("description", "Change the OPEN image with the image model; the result is saved as a new PNG and added as a new top layer (the original is never overwritten). Same cost as generateImage. source 'canvas' sends the whole composed canvas; 'layers' with a list of layer names sends those layers as separate input images, which is how subjects from different layers are combined into one scene.");
+          properties.put("prompt", Map.of("type", "string", "description", "The change to make, described concretely; say what must stay the same."));
+          properties.put("source", Map.of("type", "string", "enum", Arrays.asList("canvas", "layers"), "description", "What to send to the image model. Omit to use the user's setting."));
+          properties.put("layers", Map.of("type", "array", "items", Map.of("type", "string"), "description", "Layer names to send as separate input images (with source 'layers')."));
+          properties.put("size", Map.of("type", "string", "description", "WIDTHxHEIGHT in multiples of 32. Omit to use the user's size setting."));
+          properties.put("steps", Map.of("type", "number", "description", "Diffusion steps, 4-50. Omit to use the user's setting."));
+          properties.put("transparent", Map.of("type", "boolean", "description", "Transparent background for the result."));
+          properties.put("name", Map.of("type", "string", "description", "Short file-name hint."));
+          required.add("prompt");
+          break;
         case "askUser":
           function.put("description", "Ask the user one or more questions when you need clarification, missing information, or a decision. Do NOT guess when the request is ambiguous — call this tool first. Bundle SEVERAL related questions into a SINGLE call so the user answers them all at once. Give each question 2-4 suggested answers as options; the user can pick one or type a completely free answer. Returns the user's answers.");
           properties.put("questions", Map.of(
@@ -1792,6 +2078,8 @@ public class AgentWorker
         case "todoWrite": logAction = "📋 Updating the task list"; break;
         case "runCommand": logAction = "💻 Running command: " + args.get("command"); break;
         case "subTask": logAction = "🤖 Sub-task: " + args.get("description"); break;
+        case "generateImage": logAction = "🎨 Generating image: " + args.get("prompt"); break;
+        case "editImage": logAction = "🖌️ Editing image: " + args.get("prompt"); break;
         case "renameFile": logAction = "✏️ Renaming: " + pathArg + " → " + args.get("new_name"); break;
         case "moveFile": logAction = "📦 Moving: " + pathArg + " → " + args.get("destination"); break;
         case "copyFile": logAction = "📄 Copying: " + pathArg + " → " + args.get("destination"); break;
@@ -1804,6 +2092,7 @@ public class AgentWorker
       toolCallMsg.put("log", logAction);
       if (depth > 0) toolCallMsg.put("sub", true);
       AetherWebSocket.sendToSession(httpSessionId, toolCallMsg);
+      sendStatus(httpSessionId, "tool", logAction.length() > 80 ? logAction.substring(0, 80) + "…" : logAction);
 
       String result = "Error executing tool.";
       boolean toolError = false;
@@ -1888,6 +2177,7 @@ public class AgentWorker
           case "todoWrite": result = todoWrite(session, args); break;
           case "runCommand": result = AITools.runCommand(session, (String)args.get("command"), asInt(args.get("timeout_seconds"))); break;
           case "subTask": result = runSubAgent(session, httpSessionId, model, thinkingMode, args); break;
+          case "generateImage": case "editImage": result = runImageTool(session, httpSessionId, name, args); break;
         }
       }
       catch (InterruptedException ie) { throw ie; } // user stop: propagate so the whole turn (incl. sub-agents) ends
@@ -1926,7 +2216,7 @@ public class AgentWorker
         if (result != null) {
             if (name.equals("askUser")) {
                 summary = "✅ Answers sent to the AI";
-            } else if (name.equals("todoWrite")) {
+            } else if (name.equals("todoWrite") || name.equals("generateImage") || name.equals("editImage")) {
                 summary = "✅ " + result;
             } else if (name.equals("runCommand")) {
                 String firstLine = result.contains("\n") ? result.substring(0, result.indexOf('\n')) : result;

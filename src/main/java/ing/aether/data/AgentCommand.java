@@ -8,6 +8,8 @@ public class AgentCommand
   private boolean chatlog;
   private String response;
   private String target;
+  // For response "image": "generate" or "edit" — the prompt goes straight to the image model
+  private String mode;
 
   public String getId() { return id; }
   public void setId(String id) { this.id = id; }
@@ -21,4 +23,6 @@ public class AgentCommand
   public void setResponse(String response) { this.response = response; }
   public String getTarget() { return target; }
   public void setTarget(String target) { this.target = target; }
+  public String getMode() { return mode; }
+  public void setMode(String mode) { this.mode = mode; }
 }

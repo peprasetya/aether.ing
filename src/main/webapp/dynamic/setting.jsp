@@ -50,7 +50,7 @@
           <label for="internalmodel">Internal Model (titles, background analysis):</label>
           <select id="internalmodel" name="internalmodel" class="input-field">
 <%
-  for (String im : bean.getAllModels()) {
+  for (String im : ing.aether.tools.ai.LlmProviders.filterKind(bean.getAllModels(), ing.aether.tools.ai.LlmProviders.KindText)) {
     int imSep = im.indexOf("::");
     String imLabel = imSep > 0 ? "[" + im.substring(0, imSep) + "] " + im.substring(imSep + 2) : im;
 %>
