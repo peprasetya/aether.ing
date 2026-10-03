@@ -124,6 +124,8 @@ public class Portal extends HttpServlet implements Filter
     reloadProperty();
     CommandInitializer.scan(filterConfig.getServletContext());
     ing.aether.tools.ai.AgentWorker.loadAgents(filterConfig.getServletContext().getRealPath("/WEB-INF"));
+    // Runs interrupted by the previous shutdown come back as parked, resumable runs
+    ing.aether.tools.ai.run.RunManager.init();
     System.out.println("Aether Initialize, version: "+version);
   }
 

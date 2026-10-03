@@ -1,0 +1,11 @@
+{
+  "name": "aether.ing",
+  "short_name": "Aether",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#2563eb",
+  "icons": [
+    { "src": "/images/Aether.ing.png", "sizes": "512x512", "type": "image/png", "purpose": "any" }
+  ]
+}

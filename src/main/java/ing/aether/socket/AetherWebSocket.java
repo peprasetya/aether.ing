@@ -34,6 +34,8 @@ public class AetherWebSocket
   private static final Map<String, List<String>> sessionBuffers = new ConcurrentHashMap<>();
   private static final Map<String, Object[]> lastNotify = new ConcurrentHashMap<>();
   private static final JSON json = new JSON();
+  private static final String CLIENT_ID = "aetherClientId";
+  private static final String VISIBLE = "aetherVisible";
 
   // Toast in the client's notification-container; deduplicated so a repeating background failure doesn't spam
   public static void notify(String httpSessionId, String text)
@@ -65,7 +67,7 @@ public class AetherWebSocket
         {
           for (String msg : buffer)
           {
-            try { session.getBasicRemote().sendText(msg); } catch (IOException e) { e.printStackTrace(); }
+            sendRaw(session, msg);
           }
           // Replay-once: if no AI turn is streaming, the buffer held a finished turn — drop it so further reconnects don't duplicate it
           if (!ing.aether.tools.ai.AgentWorker.isProcessing(httpSessionId)) sessionBuffers.remove(httpSessionId);
@@ -86,14 +88,29 @@ public class AetherWebSocket
       {
         Map<String, Object> data = (Map<String, Object>) json.parse(new org.eclipse.jetty.util.ajax.JSON.ReaderSource(new java.io.StringReader(message)));
         String type = (String) data.get("type");
-        if ("chat".equals(type))
+        if (httpSession == null)
+        {
+          System.err.println("AetherWebSocket: CRITICAL - HttpSession not found in WebSocket session properties!");
+          return;
+        }
+        String issSubId = (String) httpSession.getAttribute(ing.aether.Portal.SessionAccountID);
+        String runId = data.get("runId") instanceof String ? (String) data.get("runId") : null;
+        if ("hello".equals(type))
+        {
+          // A (re)connecting tab: remember who it is, then replay what it missed of the runs it shows
+          if (data.get("clientId") instanceof String) session.getUserProperties().put(CLIENT_ID, data.get("clientId"));
+          session.getUserProperties().put(VISIBLE, !Boolean.FALSE.equals(data.get("visible")));
+          Map<String, Object> cursors = data.get("cursors") instanceof Map ? (Map<String, Object>) data.get("cursors") : null;
+          ing.aether.tools.ai.run.RunManager.attach(session, cursors);
+        } else if ("ping".equals(type))
+        {
+          session.getUserProperties().put(VISIBLE, !Boolean.FALSE.equals(data.get("visible")));
+          sendRaw(session, "{\"type\":\"pong\"}");
+        } else if ("chat".equals(type))
         {
           String msg = (String) data.get("message");
           String agentId = (String) data.get("agent_id");
           String modelId = (String) data.get("model_id");
-          String thinkingMode = (String) data.get("thinking_mode");
-          String selectedText = (String) data.get("selected_text");
-          String terminalOutput = (String) data.get("terminal_output");
           Object contextObj = data.get("context_files");
           List<String> contextFiles = null;
           if (contextObj instanceof Object[]) {
@@ -102,64 +119,70 @@ public class AetherWebSocket
           } else if (contextObj instanceof List) {
               contextFiles = (List<String>) contextObj;
           }
-          
           System.out.println("AetherWebSocket: Routing chat request. Agent=" + agentId + ", Model=" + modelId + ", ContextFiles=" + (contextFiles != null ? contextFiles.size() : 0));
-          
-          if (httpSession != null)
-          {
-            // SURGICAL FIX: Clear historical stream buffer before starting a fresh chat turn
-            sessionBuffers.remove(httpSession.getId());
-            ing.aether.tools.ai.AgentWorker.sendStatus(httpSession.getId(), "accepted", "Request accepted");
-            // Image agents: the image model and pane settings travel with every message; the image tools read them from the session
-            Object imageModel = data.get("image_model_id");
-            if (imageModel instanceof String && !((String) imageModel).isEmpty()) httpSession.setAttribute("imageModel", imageModel);
-            if (data.get("image_params") instanceof Map) httpSession.setAttribute("imageParams", data.get("image_params"));
-            ing.aether.tools.ai.AgentWorker.process(httpSession, agentId, modelId, thinkingMode, contextFiles, msg, selectedText, terminalOutput);
-          } else
-          {
-            System.err.println("AetherWebSocket: CRITICAL - HttpSession not found in WebSocket session properties!");
-          }
+          // A chat message starts a run, or steers the run already working on this chat
+          ing.aether.tools.ai.run.RunManager.handleChat(httpSession, (String) session.getUserProperties().get(CLIENT_ID), data, contextFiles);
         } else if ("clear_chat".equals(type))
         {
-          if (httpSession != null)
-          {
-            // SURGICAL FIX: Remove the buffer on clear explicitly
-            sessionBuffers.remove(httpSession.getId());
-            ing.aether.tools.ai.AgentWorker.createNewSession(httpSession);
-            System.out.println("AetherWebSocket: New chat session created.");
-          }
+          sessionBuffers.remove(httpSession.getId());
+          ing.aether.tools.ai.AgentWorker.createNewSession(httpSession);
+          ing.aether.tools.ai.run.RunManager.viewChanged(httpSession);
+          System.out.println("AetherWebSocket: New chat session created.");
         } else if ("sync_history".equals(type))
         {
-          if (httpSession != null) ing.aether.tools.ai.AgentWorker.syncChatHistory(httpSession);
-        } else if ("stop".equals(type))
+          ing.aether.tools.ai.AgentWorker.syncChatHistory(httpSession);
+        } else if ("stop".equals(type) || "cancel".equals(type))
         {
-          if (httpSession != null)
-          {
-            ing.aether.tools.ai.AgentWorker.interruptProcessing(httpSession.getId());
-          }
+          ing.aether.tools.ai.run.AgentRun run = runId != null ? ing.aether.tools.ai.run.RunManager.getOwned(runId, issSubId) : ing.aether.tools.ai.run.RunManager.activeRunForSession(httpSession);
+          if (run != null) ing.aether.tools.ai.run.RunManager.cancel(run);
+          else ing.aether.tools.ai.AgentWorker.interruptProcessing(httpSession.getId());
+        } else if ("pause".equals(type))
+        {
+          ing.aether.tools.ai.run.RunManager.pause(ing.aether.tools.ai.run.RunManager.getOwned(runId, issSubId));
+        } else if ("resume_run".equals(type))
+        {
+          if (!ing.aether.tools.ai.run.RunManager.resume(runId, httpSession)) sendError(session, "not_resumable", "This run cannot be resumed.");
+        } else if ("dismiss_run".equals(type))
+        {
+          ing.aether.tools.ai.run.RunManager.dismiss(ing.aether.tools.ai.run.RunManager.getOwned(runId, issSubId));
+        } else if ("list_runs".equals(type))
+        {
+          ing.aether.tools.ai.run.RunManager.attach(session, null);
+        } else if ("get_changes".equals(type))
+        {
+          ing.aether.tools.ai.run.StopGates.sendChanges(session, runId, issSubId);
         } else if ("permission_response".equals(type))
         {
-          if (httpSession != null)
-          {
-            boolean granted = Boolean.TRUE.equals(data.get("granted"));
-            String reason = data.get("reason") instanceof String ? (String) data.get("reason") : null;
-            ing.aether.tools.ai.AgentWorker.handlePermission(httpSession.getId(), granted, reason);
-          }
+          boolean granted = Boolean.TRUE.equals(data.get("granted"));
+          String reason = data.get("reason") instanceof String ? (String) data.get("reason") : null;
+          String runTarget = resolveRunTarget(httpSession, runId, issSubId);
+          if (!ing.aether.tools.ai.AgentWorker.handlePermission(runTarget, granted, reason, Boolean.TRUE.equals(data.get("always")))) sendError(session, "already_resolved", "This request was already answered on another device.");
         } else if ("question_response".equals(type))
         {
-          if (httpSession != null) ing.aether.tools.ai.AgentWorker.handleQuestionAnswers(httpSession.getId(), data.get("answers"));
+          String runTarget = resolveRunTarget(httpSession, runId, issSubId);
+          if (!ing.aether.tools.ai.AgentWorker.handleQuestionAnswers(runTarget, data.get("answers"))) sendError(session, "already_resolved", "These questions were already answered on another device.");
+        } else if ("decision_response".equals(type))
+        {
+          Map<String, Object> answer = data.get("answer") instanceof Map ? (Map<String, Object>) data.get("answer") : new HashMap<>();
+          if (!ing.aether.tools.ai.run.RunManager.resolveDecision(runId, (String) data.get("requestId"), answer, issSubId)) sendError(session, "already_resolved", "This request was already answered on another device.");
+        } else if ("push_subscribe".equals(type))
+        {
+          ing.aether.tools.push.WebPush.subscribe(httpSession, data.get("subscription"));
         } else if ("list_sessions".equals(type))
         {
-          if (httpSession != null) ing.aether.tools.ai.AgentWorker.broadcastSessionList(httpSession);
+          ing.aether.tools.ai.AgentWorker.broadcastSessionList(httpSession);
         } else if ("switch_session".equals(type))
         {
-          if (httpSession != null) ing.aether.tools.ai.AgentWorker.switchSession(httpSession, (String) data.get("id"));
+          ing.aether.tools.ai.AgentWorker.switchSession(httpSession, (String) data.get("id"));
+          ing.aether.tools.ai.run.RunManager.viewChanged(httpSession);
         } else if ("delete_session".equals(type))
         {
-          if (httpSession != null) ing.aether.tools.ai.AgentWorker.deleteSession(httpSession, (String) data.get("id"));
+          ing.aether.tools.ai.AgentWorker.deleteSession(httpSession, (String) data.get("id"));
+          ing.aether.tools.ai.run.RunManager.viewChanged(httpSession);
         } else if ("clear_all_sessions".equals(type))
         {
-          if (httpSession != null) ing.aether.tools.ai.AgentWorker.clearAllSessions(httpSession);
+          ing.aether.tools.ai.AgentWorker.clearAllSessions(httpSession);
+          ing.aether.tools.ai.run.RunManager.viewChanged(httpSession);
         }
       } catch (Exception e)
       {
@@ -208,7 +231,7 @@ public class AetherWebSocket
       {
         if (s.isOpen())
         {
-          try { s.getBasicRemote().sendText(msg); } catch (IOException e) { e.printStackTrace(); }
+          sendRaw(s, msg);
         }
       }
     }
@@ -221,6 +244,8 @@ public class AetherWebSocket
 
   public static boolean sendToSession(String httpSessionId, Object data, boolean buffer)
   {
+    // Agent runs use their run id as session id: log the event and fan it out to the owner's devices
+    if (ing.aether.tools.ai.run.RunManager.isRun(httpSessionId)) return ing.aether.tools.ai.run.RunManager.emit(httpSessionId, data, buffer);
     String msg = json.toJSON(data);
 
     // Never buffer real-time or full-state snapshot types: replaying a stale snapshot on reconnect overwrites newer client state
@@ -247,7 +272,7 @@ public class AetherWebSocket
         if (!s.isOpen()) { sessions.remove(s); continue; }
         if (httpSessionId.equals(getHttpSessionId(s)))
         {
-          try { s.getBasicRemote().sendText(msg); delivered = true; } catch (IOException e) { e.printStackTrace(); }
+          if (sendRaw(s, msg)) delivered = true;
         }
       }
     }
@@ -274,5 +299,74 @@ public class AetherWebSocket
       return ((jakarta.servlet.http.HttpSession)session).getId();
     }
     return null;
+  }
+
+  // Blocking sends on one socket must never overlap: run threads, the monitor and socket threads all send
+  public static boolean sendRaw(Session s, String text)
+  {
+    if (s == null || !s.isOpen()) return false;
+    synchronized (s)
+    {
+      try
+      {
+        s.getBasicRemote().sendText(text);
+        return true;
+      } catch (IOException | IllegalStateException e) { return false; }
+    }
+  }
+
+  private static void sendError(Session s, String code, String message)
+  {
+    Map<String, Object> m = new HashMap<>();
+    m.put("type", "error");
+    m.put("code", code);
+    m.put("message", message);
+    sendRaw(s, json.toJSON(m));
+  }
+
+  public static jakarta.servlet.http.HttpSession httpSessionOf(Session s)
+  {
+    Object session = s.getUserProperties().get("javax.servlet.http.HttpSession");
+    return session instanceof jakarta.servlet.http.HttpSession ? (jakarta.servlet.http.HttpSession) session : null;
+  }
+
+  // Open AI sockets of one account across all its browsers and devices
+  public static List<Session> socketsOfUser(String issSubId)
+  {
+    List<Session> result = new ArrayList<>();
+    List<Session> sessions = targetSessions.get("aetherui");
+    if (sessions == null || issSubId == null) return result;
+    for (Session s : sessions)
+    {
+      if (!s.isOpen()) continue;
+      jakarta.servlet.http.HttpSession hs = httpSessionOf(s);
+      try
+      {
+        if (hs != null && issSubId.equals(hs.getAttribute(ing.aether.Portal.SessionAccountID))) result.add(s);
+      } catch (IllegalStateException e) {}
+    }
+    return result;
+  }
+
+  public static List<Session> socketsOfHttpSession(String httpSessionId)
+  {
+    List<Session> result = new ArrayList<>();
+    List<Session> sessions = targetSessions.get("aetherui");
+    if (sessions == null) return result;
+    for (Session s : sessions) if (s.isOpen() && httpSessionId.equals(getHttpSessionId(s))) result.add(s);
+    return result;
+  }
+
+  public static boolean isVisible(Session s)
+  {
+    return !Boolean.FALSE.equals(s.getUserProperties().get(VISIBLE));
+  }
+
+  // Answers name the run they belong to; older clients only know their own chat's active run
+  private static String resolveRunTarget(jakarta.servlet.http.HttpSession httpSession, String runId, String issSubId)
+  {
+    if (runId != null && ing.aether.tools.ai.run.RunManager.getOwned(runId, issSubId) != null) return runId;
+    ing.aether.tools.ai.run.AgentRun run = ing.aether.tools.ai.run.RunManager.activeRunForSession(httpSession);
+    return run != null ? run.runId : httpSession.getId();
   }
 }

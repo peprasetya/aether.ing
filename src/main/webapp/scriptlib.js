@@ -1531,13 +1531,534 @@ function clearAllSessions()
 function wsSend(message)
 {
   if (ws && ws.readyState === 1) ws.send(message);
-  else if (ws && ws.readyState === 0) showNotification("AI Assistant is still connecting. Please wait a moment.");
   else
   {
-    showNotification("WebSocket Disconnected! Attempting to reconnect...");
+    // Kept and sent after the reconnect (phones drop the socket whenever the tab is backgrounded)
+    if (wsOutbox.length < 50) wsOutbox.push(message);
+    if (wsOutbox.length === 1) showNotification("Offline — your message will be sent when the connection is back.");
+    wsFailCount = 0;
     webConnect();
   }
   return false;
+}
+
+// ===== Agent runs: cursors, reconnect, steering, cross-device approvals =====
+let wsOutbox = [];
+let runCursors = {};      // runId -> last applied event seq (replay de-duplication)
+let runList = [];         // run summaries of this user (all devices)
+let viewedRun = null;     // summary of the run working on the chat shown here
+let wsPingTimer = null;
+const aiClientId = (function() {
+  var id = null;
+  try { id = sessionStorage.getItem('aetherClientId'); } catch (e) {}
+  if (!id)
+  {
+    id = 'c-' + Math.random().toString(36).substring(2) + Date.now().toString(36);
+    try { sessionStorage.setItem('aetherClientId', id); } catch (e) {}
+  }
+  return id;
+})();
+
+function sendHello()
+{
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ type: 'hello', clientId: aiClientId, visible: !document.hidden, cursors: runCursors }));
+  while (wsOutbox.length > 0) ws.send(wsOutbox.shift());
+}
+
+function startWsKeepalive()
+{
+  if (wsPingTimer) clearInterval(wsPingTimer);
+  wsPingTimer = setInterval(function() {
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'ping', visible: !document.hidden }));
+  }, 25000);
+}
+
+// Phones freeze background tabs: coming back must reconnect at once and fetch what was missed
+document.addEventListener('visibilitychange', function() {
+  if (typeof wsTarget === 'undefined' || wsTarget !== 'aetherui') return;
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'ping', visible: !document.hidden }));
+  else if (!document.hidden) { wsFailCount = 0; webConnect(); }
+});
+window.addEventListener('online', function() {
+  if (typeof wsTarget === 'undefined' || wsTarget !== 'aetherui') return;
+  wsFailCount = 0;
+  webConnect();
+});
+
+function runRef(obj)
+{
+  if (window.pendingRunId) obj.runId = window.pendingRunId;
+  return obj;
+}
+
+function isActiveRunState(state)
+{
+  return state === 'WORKING' || state === 'WAITING_INPUT' || state === 'REVIEWING';
+}
+
+function updateRunInList(run)
+{
+  if (!run) return;
+  var found = false;
+  for (var i = 0; i < runList.length; i++) if (runList[i].runId === run.runId) { runList[i] = run; found = true; }
+  if (!found) runList.unshift(run);
+  renderRunsPanel();
+}
+
+function renderRunsPanel()
+{
+  var needs = 0, active = 0;
+  for (var i = 0; i < runList.length; i++)
+  {
+    if (runList[i].needsInput) needs++;
+    if (isActiveRunState(runList[i].state)) active++;
+  }
+  var badge = document.getElementById('runs-badge');
+  if (badge)
+  {
+    badge.textContent = needs > 0 ? String(needs) : (active > 0 ? String(active) : '');
+    badge.classList.toggle('hidden', needs === 0 && active === 0);
+    badge.classList.toggle('attention', needs > 0);
+  }
+  var headerBadge = document.getElementById('run-attention-badge');
+  if (headerBadge)
+  {
+    headerBadge.textContent = String(needs);
+    headerBadge.classList.toggle('hidden', needs === 0);
+  }
+  var baseTitle = document.title.replace(/^\(\d+\) /, '');
+  document.title = needs > 0 ? '(' + needs + ') ' + baseTitle : baseTitle;
+
+  var list = document.getElementById('runs-list');
+  if (!list) return;
+  list.innerHTML = '';
+  if (runList.length === 0)
+  {
+    list.innerHTML = '<div class="run-empty">No agent runs yet.</div>';
+    return;
+  }
+  runList.forEach(function(run) {
+    var row = document.createElement('div');
+    row.className = 'run-item';
+    var chip = document.createElement('span');
+    chip.className = 'run-chip state-' + String(run.state).toLowerCase();
+    chip.textContent = runStateLabel(run);
+    var title = document.createElement('div');
+    title.className = 'run-title';
+    title.textContent = run.objective || '(no message)';
+    var meta = document.createElement('div');
+    meta.className = 'run-meta';
+    var where = run.workingDir ? run.workingDir.substring(run.workingDir.lastIndexOf('/') + 1) : '';
+    meta.textContent = (run.behavior === 'autonomous' ? '🤖 task · ' : '💬 chat · ') + where + (run.todoTotal ? ' · ' + run.todoDone + '/' + run.todoTotal : '') + ' · ' + sessionRelativeTime(run.updated);
+    var acts = document.createElement('div');
+    acts.className = 'run-actions';
+    var open = document.createElement('button');
+    open.className = 'p-btn';
+    open.textContent = 'Open';
+    open.onclick = function(e) { e.stopPropagation(); openRun(run); };
+    acts.appendChild(open);
+    if (isActiveRunState(run.state))
+    {
+      var stop = document.createElement('button');
+      stop.className = 'p-btn review-reject';
+      stop.textContent = 'Stop';
+      stop.onclick = function(e) { e.stopPropagation(); wsSend(JSON.stringify({ type: 'cancel', runId: run.runId })); };
+      acts.appendChild(stop);
+    }
+    if (run.state === 'PARKED')
+    {
+      var resume = document.createElement('button');
+      resume.className = 'p-btn review-approve';
+      resume.textContent = 'Resume';
+      resume.onclick = function(e) { e.stopPropagation(); resumeRun(run); };
+      acts.appendChild(resume);
+      var dismiss = document.createElement('button');
+      dismiss.className = 'p-btn';
+      dismiss.textContent = 'Dismiss';
+      dismiss.onclick = function(e) { e.stopPropagation(); wsSend(JSON.stringify({ type: 'dismiss_run', runId: run.runId })); };
+      acts.appendChild(dismiss);
+    }
+    row.appendChild(chip);
+    row.appendChild(title);
+    row.appendChild(meta);
+    row.appendChild(acts);
+    list.appendChild(row);
+  });
+}
+
+function runStateLabel(run)
+{
+  if (run.state === 'WAITING_INPUT') return 'needs you';
+  if (run.state === 'PARKED') return run.stopReason === 'interrupted' ? 'interrupted' : 'parked';
+  if (run.state === 'REVIEWING') return 'reviewing';
+  if (run.state === 'WORKING') return 'working';
+  if (run.state === 'COMPLETED') return 'done';
+  if (run.state === 'FAILED') return 'failed';
+  if (run.state === 'CANCELLED') return 'stopped';
+  return String(run.state).toLowerCase();
+}
+
+function toggleRunsPanel(event)
+{
+  if (event) event.stopPropagation();
+  var panel = document.getElementById('runs-dropdown');
+  if (!panel) return;
+  var opening = !panel.classList.contains('show');
+  panel.classList.toggle('show', opening);
+  if (opening) wsSend(JSON.stringify({ type: 'list_runs' }));
+}
+
+// A run lives in one chat of one project: bring this device to that chat
+function openRun(run)
+{
+  var panel = document.getElementById('runs-dropdown');
+  if (panel) panel.classList.remove('show');
+  if (run.workingDir && run.workingDir !== window.workingDir)
+  {
+    window.location.href = '/run/' + run.runId;
+    return;
+  }
+  if (run.chatSessionId && run.chatSessionId !== window.currentChatSessionId) wsSend(JSON.stringify({ type: 'switch_session', id: run.chatSessionId }));
+  showPane('chat');
+}
+
+function resumeRun(run)
+{
+  if (run.workingDir && run.workingDir !== window.workingDir)
+  {
+    showAlert('Open the project ' + run.workingDir + ' first, then resume the run from there.', 'Resume run');
+    return;
+  }
+  wsSend(JSON.stringify({ type: 'resume_run', runId: run.runId }));
+}
+
+// Deep link /run/<id> (from a push notification or another device)
+function openRunDeepLink(runId, wd, chatId)
+{
+  if (!wd) { showNotification('This run is no longer available.'); return; }
+  window.workingDir = wd;
+  window.expandTarget = wd;
+  try { history.replaceState(null, '', '/tree/' + wd); } catch (e) {}
+  makeRequest('tree/' + wd, '', false, function() {
+    if (chatId) wsSend(JSON.stringify({ type: 'switch_session', id: chatId }));
+    showPane('chat');
+  });
+}
+
+// Scrolls the phone layout to one pane (the desktop shows all three anyway)
+function showPane(name)
+{
+  var workspace = document.getElementById('workspace');
+  var pane = document.getElementById('pane-' + name);
+  if (workspace && pane && window.innerWidth <= 768) workspace.scrollTo({ left: pane.offsetLeft, behavior: 'smooth' });
+}
+
+function setViewedRun(run)
+{
+  viewedRun = run && (isActiveRunState(run.state) || run.state === 'PARKED') ? run : null;
+  renderRunBanner();
+  if (viewedRun && isActiveRunState(viewedRun.state))
+  {
+    if (!window.aiWorking) { setAiWorking(true); startAiStatus('Working…'); }
+  }
+  else if (window.aiWorking && run) setAiWorking(false);
+}
+
+function renderRunBanner()
+{
+  var banner = document.getElementById('run-banner');
+  if (!banner) return;
+  banner.innerHTML = '';
+  if (!viewedRun)
+  {
+    banner.classList.add('hidden');
+    return;
+  }
+  banner.classList.remove('hidden');
+  var run = viewedRun;
+  var chip = document.createElement('span');
+  chip.className = 'run-chip state-' + String(run.state).toLowerCase();
+  chip.textContent = runStateLabel(run);
+  var text = document.createElement('span');
+  text.className = 'run-banner-text';
+  text.textContent = (run.behavior === 'autonomous' ? '🤖 ' : '') + (run.objective || '') + (run.todoTotal ? ' · ' + run.todoDone + '/' + run.todoTotal : '');
+  banner.appendChild(chip);
+  banner.appendChild(text);
+  var acts = document.createElement('span');
+  acts.className = 'run-actions';
+  function btn(label, cls, fn)
+  {
+    var b = document.createElement('button');
+    b.className = 'p-btn ' + (cls || '');
+    b.textContent = label;
+    b.onclick = fn;
+    acts.appendChild(b);
+  }
+  if (run.state === 'PARKED')
+  {
+    btn('Resume', 'review-approve', function() { resumeRun(run); });
+    btn('Dismiss', '', function() { wsSend(JSON.stringify({ type: 'dismiss_run', runId: run.runId })); });
+  }
+  else
+  {
+    if (run.behavior === 'autonomous') btn('Pause', '', function() { wsSend(JSON.stringify({ type: 'pause', runId: run.runId })); showNotification('The run pauses at the next step.'); });
+    btn('Changes', '', function() { wsSend(JSON.stringify({ type: 'get_changes', runId: run.runId })); });
+    btn('Stop', 'review-reject', function() { stopAiActivity(); });
+  }
+  banner.appendChild(acts);
+}
+
+// Plan / budget / human gate / pause cards: answered from any device with decision_response
+function showDecisionCard(data)
+{
+  var historyEl = document.getElementById('chat-history');
+  if (!historyEl) return;
+  if (historyEl.querySelector('[data-request-id="' + data.requestId + '"]')) return;
+  wasAtBottom = isAtBottom(historyEl);
+  var block = document.createElement('div');
+  block.className = 'msg ai decision-block';
+  block.dataset.requestId = data.requestId;
+  block.dataset.runId = data.runId;
+  var header = document.createElement('div');
+  header.className = 'question-header';
+  var body = document.createElement('div');
+  body.className = 'decision-body';
+  var actions = document.createElement('div');
+  actions.className = 'question-actions';
+  function answer(obj) { freezeDecision(block, '✅ Answered'); wsSend(JSON.stringify({ type: 'decision_response', runId: data.runId, requestId: data.requestId, answer: obj })); }
+  function button(label, cls, fn) { var b = document.createElement('button'); b.className = 'p-btn ' + (cls || ''); b.textContent = label; b.onclick = fn; actions.appendChild(b); return b; }
+
+  if (data.type === 'plan_request')
+  {
+    header.textContent = '🗺️ Plan for approval';
+    if (data.summary)
+    {
+      var sum = document.createElement('div');
+      sum.className = 'patch-explain';
+      sum.textContent = data.summary;
+      body.appendChild(sum);
+    }
+    var dodLabel = document.createElement('div');
+    dodLabel.className = 'decision-label';
+    dodLabel.textContent = 'Definition of Done (one per line)';
+    var dod = document.createElement('textarea');
+    dod.className = 'decision-edit';
+    dod.value = (data.dod || []).join('\n');
+    var todoLabel = document.createElement('div');
+    todoLabel.className = 'decision-label';
+    todoLabel.textContent = 'Todo list (one per line)';
+    var todos = document.createElement('textarea');
+    todos.className = 'decision-edit';
+    todos.value = (data.todos || []).join('\n');
+    var note = document.createElement('input');
+    note.type = 'text';
+    note.className = 'review-reason-input';
+    note.placeholder = 'Note for the AI (optional)...';
+    body.appendChild(dodLabel);
+    body.appendChild(dod);
+    body.appendChild(todoLabel);
+    body.appendChild(todos);
+    body.appendChild(note);
+    function lines(t) { return t.value.split('\n').map(function(x) { return x.trim(); }).filter(function(x) { return x !== ''; }); }
+    button('✔ Approve', 'review-approve', function() { answer({ decision: 'approve', dod: lines(dod), todos: lines(todos), note: note.value.trim() }); });
+    button('✖ Reject', 'review-reject', function() { answer({ decision: 'reject', note: note.value.trim() }); });
+  }
+  else if (data.type === 'budget_request')
+  {
+    header.textContent = '⏳ Budget reached';
+    body.textContent = data.message || 'The run used its model-call budget.';
+    button('+10', 'review-approve', function() { answer({ extend: 10 }); });
+    button('+25', 'review-approve', function() { answer({ extend: 25 }); });
+    button('+50', 'review-approve', function() { answer({ extend: 50 }); });
+    button('Stop here', 'review-reject', function() { answer({ extend: 0 }); });
+  }
+  else if (data.type === 'human_gate')
+  {
+    header.textContent = '🏁 Final approval';
+    var msg = document.createElement('div');
+    msg.innerHTML = mdToHtml(data.message || '');
+    body.appendChild(msg);
+    if (data.changes && data.changes.length)
+    {
+      var ch = document.createElement('div');
+      ch.className = 'decision-label';
+      ch.textContent = 'Changed: ' + data.changes.join(', ');
+      body.appendChild(ch);
+    }
+    var hnote = document.createElement('input');
+    hnote.type = 'text';
+    hnote.className = 'review-reason-input';
+    hnote.placeholder = 'What should change? (for Request changes)';
+    body.appendChild(hnote);
+    button('✔ Accept', 'review-approve', function() { answer({ decision: 'accept' }); });
+    button('↺ Request changes', 'review-reject', function() { answer({ decision: 'revise', note: hnote.value.trim() }); });
+  }
+  else if (data.type === 'pause_request')
+  {
+    header.textContent = '⏸️ Paused';
+    body.textContent = data.message || 'The run is paused.';
+    button('▶ Resume', 'review-approve', function() { answer({ resume: true }); });
+  }
+  block.appendChild(header);
+  block.appendChild(body);
+  block.appendChild(actions);
+  historyEl.appendChild(block);
+  scrollToBottomIfWatching(historyEl);
+}
+
+function freezeDecision(block, label)
+{
+  var actions = block.querySelector('.question-actions');
+  if (actions) actions.remove();
+  var inputs = block.querySelectorAll('textarea, input');
+  for (var i = 0; i < inputs.length; i++) inputs[i].disabled = true;
+  var header = block.querySelector('.question-header');
+  if (header && label) header.textContent = label + ' — ' + header.textContent.replace(/^[^ ]+ /, '');
+}
+
+// Another device (or this one) answered: close every card still waiting for that answer
+function onApprovalResolved(data)
+{
+  if (data.requestId)
+  {
+    var blocks = document.querySelectorAll('.decision-block[data-request-id="' + data.requestId + '"]');
+    for (var i = 0; i < blocks.length; i++) if (blocks[i].querySelector('.question-actions')) freezeDecision(blocks[i], '✅ Answered');
+    return;
+  }
+  if (data.kind === 'permission')
+  {
+    if (pendingEditReview) resolveEditReview(!!data.granted, true);
+    var modal = document.getElementById('permission-modal');
+    if (modal) modal.classList.add('hidden');
+    var patches = document.querySelectorAll('.patch-block');
+    for (var j = 0; j < patches.length; j++)
+    {
+      var acts = patches[j].querySelector('.patch-actions');
+      if (!acts) continue;
+      acts.remove();
+      var header = patches[j].querySelector('.patch-header');
+      if (header) header.textContent = (data.granted ? '✅ Approved — ' : '❌ Rejected — ') + header.textContent;
+    }
+  }
+  else if (data.kind === 'question')
+  {
+    var qs = document.querySelectorAll('.question-block');
+    for (var k = 0; k < qs.length; k++)
+    {
+      var qa = qs[k].querySelector('.question-actions');
+      if (!qa) continue;
+      qa.remove();
+      var inputs = qs[k].querySelectorAll('input, button');
+      for (var m = 0; m < inputs.length; m++) inputs[m].disabled = true;
+      var qh = qs[k].querySelector('.question-header');
+      if (qh) qh.textContent = '✅ Answered';
+    }
+  }
+}
+
+function appendGateCard(data)
+{
+  var historyEl = document.getElementById('chat-history');
+  if (!historyEl) return;
+  var div = document.createElement('div');
+  div.className = 'msg tool gate-card ' + (data.pass ? 'gate-pass' : 'gate-fail');
+  div.textContent = (data.pass ? '✅ ' : '⛔ ') + 'Stop gate "' + data.gate + '": ' + (data.detail || '');
+  historyEl.appendChild(div);
+  scrollToBottomIfWatching(historyEl);
+}
+
+function appendReviewCard(data)
+{
+  var historyEl = document.getElementById('chat-history');
+  if (!historyEl) return;
+  var div = document.createElement('div');
+  div.className = 'msg ai review-card verdict-' + data.verdict;
+  var head = document.createElement('div');
+  head.className = 'question-header';
+  head.textContent = '🧐 Reviewer (' + (data.model || '') + '): ' + String(data.verdict).toUpperCase();
+  div.appendChild(head);
+  var issues = data.issues || [];
+  for (var i = 0; i < issues.length; i++)
+  {
+    var it = document.createElement('div');
+    it.className = 'review-issue sev-' + (issues[i].severity || 'low');
+    it.textContent = '[' + (issues[i].severity || '?') + '] ' + (issues[i].file ? issues[i].file + ': ' : '') + (issues[i].problem || '');
+    div.appendChild(it);
+  }
+  var checks = data.dodChecks || [];
+  for (var j = 0; j < checks.length; j++)
+  {
+    var c = document.createElement('div');
+    c.className = 'review-check';
+    c.textContent = (checks[j].pass ? '☑ ' : '☐ ') + checks[j].item;
+    div.appendChild(c);
+  }
+  historyEl.appendChild(div);
+  scrollToBottomIfWatching(historyEl);
+}
+
+function showRunChanges(data)
+{
+  var modal = document.getElementById('run-changes-modal');
+  var body = document.getElementById('run-changes-body');
+  if (!modal || !body) return;
+  body.innerHTML = '';
+  var files = document.createElement('div');
+  files.className = 'decision-label';
+  files.textContent = data.files && data.files.length ? 'Changed files: ' + data.files.join(', ') : 'No file changes recorded for this run.';
+  body.appendChild(files);
+  if (data.diff)
+  {
+    var pre = document.createElement('pre');
+    pre.className = 'diff-view';
+    data.diff.split('\n').forEach(function(line) {
+      var span = document.createElement('span');
+      if (line.indexOf('+') === 0 && line.indexOf('+++') !== 0) span.className = 'diff-line-add';
+      else if (line.indexOf('-') === 0 && line.indexOf('---') !== 0) span.className = 'diff-line-del';
+      else if (line.indexOf('@@') === 0) span.className = 'diff-line-hunk';
+      span.textContent = line + '\n';
+      pre.appendChild(span);
+    });
+    body.appendChild(pre);
+  }
+  else if (data.git === false)
+  {
+    var hint = document.createElement('div');
+    hint.className = 'run-empty';
+    hint.textContent = 'A line-by-line diff is available for git projects on SSH.';
+    body.appendChild(hint);
+  }
+  modal.classList.remove('hidden');
+}
+
+// Web Push: lets the phone ring when a run needs input or finishes while no Aether tab is open
+function enablePushNotifications()
+{
+  if (!('serviceWorker' in navigator) || !('PushManager' in window))
+  {
+    showAlert('This browser does not support push notifications. On iPhone, add Aether to the Home Screen first.', 'Notifications');
+    return;
+  }
+  if (!window.aetherVapidKey) { showAlert('Push is not configured on this server.', 'Notifications'); return; }
+  navigator.serviceWorker.register('/sw.js').then(function(reg) {
+    return Notification.requestPermission().then(function(perm) {
+      if (perm !== 'granted') throw new Error('permission ' + perm);
+      return reg.pushManager.getSubscription().then(function(existing) {
+        if (existing) return existing;
+        var key = window.aetherVapidKey.replace(/-/g, '+').replace(/_/g, '/');
+        while (key.length % 4) key += '=';
+        var raw = atob(key);
+        var bytes = new Uint8Array(raw.length);
+        for (var i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+        return reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: bytes });
+      });
+    });
+  }).then(function(sub) {
+    wsSend(JSON.stringify({ type: 'push_subscribe', subscription: sub.toJSON() }));
+  }).catch(function(e) {
+    showAlert('Could not enable notifications: ' + e.message, 'Notifications');
+  });
 }
 
 let aiResponseBuffer = "";
@@ -1596,6 +2117,8 @@ function onAIWsOpen()
   console.log('AI WebSocket Connected');
   var status=document.getElementById('ws-status');
   if (status) status.classList.add('connected');
+  sendHello();
+  startWsKeepalive();
   requestChatSyncIfEmpty();
 }
 
@@ -1885,6 +2408,53 @@ function extractAndRepairJson(text)
 function onAIWsMessage(event)
 {
   const data = JSON.parse(event.data);
+  // Run events carry a sequence number: a replay after a reconnect must not apply anything twice
+  if (data.runId && data.seq)
+  {
+    if (data.seq <= (runCursors[data.runId] || 0)) return;
+    runCursors[data.runId] = data.seq;
+  }
+  if (data.runId && (data.type === 'permission_request' || data.type === 'user_question')) window.pendingRunId = data.runId;
+  if (data.type === 'run_list')
+  {
+    runList = data.runs || [];
+    renderRunsPanel();
+    return;
+  }
+  if (data.type === 'run_update')
+  {
+    updateRunInList(data.run);
+    if (data.viewing) setViewedRun(data.run);
+    return;
+  }
+  if (data.type === 'view_state')
+  {
+    setViewedRun(data.run);
+    if (!data.run && window.aiWorking) setAiWorking(false);
+    return;
+  }
+  if (data.type === 'run_attach')
+  {
+    runCursors[data.runId] = data.fromSeq;
+    return;
+  }
+  if (data.type === 'user_message')
+  {
+    // The sender shows its own message at once; other devices learn about it here
+    if (data.origin !== aiClientId) appendMessage('user', data.content);
+    return;
+  }
+  if (data.type === 'approval_resolved') { onApprovalResolved(data); return; }
+  if (data.type === 'plan_request' || data.type === 'budget_request' || data.type === 'human_gate' || data.type === 'pause_request') { showDecisionCard(data); return; }
+  if (data.type === 'gate_result') { appendGateCard(data); return; }
+  if (data.type === 'review_start') { updateAiStatus({ stage: 'thinking', text: 'Reviewer ' + (data.model || '') + ' is checking the work…' }); return; }
+  if (data.type === 'review_verdict') { appendReviewCard(data); return; }
+  if (data.type === 'run_changes') { showRunChanges(data); return; }
+  if (data.type === 'steer_applied') { updateAiStatus({ stage: 'sending', text: 'Applying your message…' }); return; }
+  if (data.type === 'error') { showNotification(data.message, 5000); return; }
+  if (data.type === 'pong' || data.type === 'checkpoint' || data.type === 'run_created' || data.type === 'run_state') return;
+  // Editor insertions belong to the device that asked for them
+  if ((data.type === 'plaintext' || data.type === 'variants') && data.origin && data.origin !== aiClientId) return;
   if (data.type === 'chat_delta')
   {
     // SURGICAL FIX: Ignore trailing or replayed delta chunks if variants are already out
@@ -2505,9 +3075,34 @@ function onAgentChange()
   if (imageModelSelect) imageModelSelect.classList.toggle('hidden', !isImageAgent);
   const imageControls = document.getElementById('image-ai-controls');
   if (imageControls) imageControls.classList.toggle('hidden', !isImageAgent);
+  const taskOptions = document.getElementById('task-options');
+  if (taskOptions) taskOptions.classList.toggle('hidden', !(currentAgent && currentAgent.behavior === 'autonomous'));
+  fillReviewerSelect();
 
   console.log('Agent changed to:', currentAgent ? currentAgent.id : 'null', 'Commands:', currentAgent && currentAgent.commands ? currentAgent.commands.length : 0);
   renderAgentCommands();
+}
+
+// Reviewer choices mirror the text models of the model select; empty means no reviewer gate
+function fillReviewerSelect()
+{
+  var sel = document.getElementById('task-reviewer-select');
+  var models = document.getElementById('model-select');
+  if (!sel || !models) return;
+  var previous = sel.value || (currentAgent && currentAgent.reviewer ? currentAgent.reviewer.model : '');
+  sel.innerHTML = '';
+  var none = document.createElement('option');
+  none.value = '';
+  none.textContent = 'Reviewer: none';
+  sel.appendChild(none);
+  for (var i = 0; i < models.options.length; i++)
+  {
+    var o = document.createElement('option');
+    o.value = models.options[i].value;
+    o.textContent = 'Reviewer: ' + models.options[i].textContent;
+    sel.appendChild(o);
+  }
+  if (previous) sel.value = previous;
 }
 
 function renderAgentCommands() 
@@ -2582,22 +3177,43 @@ function sendChatMessage(message, commandId, commandLabel)
     selected_text: selectedText
   };
   if (pendingTerminalOutput) payload.terminal_output = pendingTerminalOutput;
+  // Autonomous task agents: per-run plan approval and reviewer model
+  if (currentAgent && currentAgent.behavior === 'autonomous')
+  {
+    var planGate = document.getElementById('task-plan-gate');
+    var reviewer = document.getElementById('task-reviewer-select');
+    payload.plan_gate = planGate ? planGate.checked : true;
+    if (reviewer && reviewer.value) payload.reviewer_model = reviewer.value;
+  }
+  // While a run works on this chat the message steers it; interrupt mode also cuts the current answer
+  if (window.aiWorking && window.steerInterrupt) payload.steer_mode = 'interrupt';
+  window.steerInterrupt = false;
   if (currentAgent && currentAgent.image)
   {
     const imageModel = document.getElementById('image-model-select');
     if (imageModel && imageModel.value) payload.image_model_id = imageModel.value;
     payload.image_params = imageParamsFromPane();
   }
+  var steering = !!window.aiWorking;
   wsSend(JSON.stringify(payload));
   clearTerminalContext();
+  if (steering) return;
   setAiWorking(true);
   startAiStatus('Sending…');
+}
+
+function sendSteerInterrupt()
+{
+  window.steerInterrupt = true;
+  sendChatMessage();
 }
 
 function stopAiActivity()
 {
   resolveEditReview(false, true);
-  wsSend(JSON.stringify({ type: 'stop' }));
+  var stop = { type: 'stop' };
+  if (viewedRun) stop.runId = viewedRun.runId;
+  wsSend(JSON.stringify(stop));
   setAiWorking(false);
 }
 
@@ -2606,22 +3222,29 @@ function setAiWorking(working)
   window.aiWorking = working; // terminal auto-error reporting must not interrupt a running turn
   const sendBtn = document.getElementById('send-btn');
   const stopBtn = document.getElementById('stop-btn');
+  const interruptBtn = document.getElementById('steer-interrupt-btn');
+  const input = document.getElementById('chat-input');
+  // Send stays available while the AI works: a message then steers the running task
+  if (sendBtn) sendBtn.classList.remove('hidden');
   if (working)
   {
-    if (sendBtn) sendBtn.classList.add('hidden');
     if (stopBtn) stopBtn.classList.remove('hidden');
+    if (interruptBtn) interruptBtn.classList.remove('hidden');
+    if (input) input.placeholder = 'Steer the running task… (applied after the current step)';
   }
   else
   {
-    if (sendBtn) sendBtn.classList.remove('hidden');
     if (stopBtn) stopBtn.classList.add('hidden');
+    if (interruptBtn) interruptBtn.classList.add('hidden');
+    if (input) input.placeholder = 'Ask AI...';
     stopAiStatus();
   }
 }
 
-function respondPermission(granted)
+function respondPermission(granted, always)
 {
-  var response = { type: 'permission_response', granted: granted };
+  var response = runRef({ type: 'permission_response', granted: granted });
+  if (granted && always) response.always = true;
   var reasonInput = document.getElementById('permission-reason');
   if (!granted && reasonInput && reasonInput.value.trim()) response.reason = reasonInput.value.trim();
   if (reasonInput) reasonInput.value = '';
@@ -2638,6 +3261,8 @@ function showPermissionModal(data)
   if (modal && details && msg)
   {
     msg.textContent = (data.message || ('The AI agent wants to use tool: ' + data.tool)) + (data.sub ? ' (sub-agent)' : '');
+    var alwaysBtn = document.getElementById('permission-always-btn');
+    if (alwaysBtn) alwaysBtn.classList.toggle('hidden', !data.canAlways);
     var explainLine = data.args && data.args.explain ? 'Why: ' + data.args.explain + '\n\n' : '';
     details.textContent = explainLine + JSON.stringify(data.args, null, 2);
     modal.classList.remove('hidden');
@@ -2731,6 +3356,7 @@ function showChatPatchApproval(data)
 
   var block = document.createElement('div');
   block.className = 'msg ai patch-block';
+  if (data.canAlways) block.dataset.canAlways = '1';
   // Full-content proposals show at natural height (the chat log scrolls); patchFile keeps the capped diff area
   if (data.tool === 'createFile' || data.tool === 'writeFile') block.classList.add('patch-full');
 
@@ -2828,17 +3454,27 @@ function buildPatchActions(actions, block)
     input.focus();
   };
   actions.appendChild(approve);
+  if (block.dataset.canAlways === '1')
+  {
+    var always = document.createElement('button');
+    always.className = 'p-btn review-approve';
+    always.textContent = '✔ Always (this run)';
+    always.title = 'Approve, and let this run use the same tool without asking again';
+    always.onclick = function() { resolveChatPatch(block, true, null, true); };
+    actions.appendChild(always);
+  }
   actions.appendChild(reject);
 }
 
-function resolveChatPatch(block, granted, reason)
+function resolveChatPatch(block, granted, reason, always)
 {
   var actions = block.querySelector('.patch-actions');
   if (actions) actions.remove();
   var header = block.querySelector('.patch-header');
   if (header) header.textContent = (granted ? '✅ Approved — ' : '❌ Rejected — ') + header.textContent;
-  var response = { type: 'permission_response', granted: granted };
+  var response = runRef({ type: 'permission_response', granted: granted });
   if (!granted && reason) response.reason = reason;
+  if (granted && always) response.always = true;
   wsSend(JSON.stringify(response));
 }
 
@@ -2952,7 +3588,7 @@ function resolveUserQuestions(block)
   var header = block.querySelector('.question-header');
   if (header) header.textContent = '✅ Answered';
 
-  wsSend(JSON.stringify({ type: 'question_response', answers: answers }));
+  wsSend(JSON.stringify(runRef({ type: 'question_response', answers: answers })));
 }
 
 function applyEditPreview(data, edits, wholeNewContent)
@@ -3105,7 +3741,7 @@ function resolveEditReview(granted, skipResponse, reason)
   }
   if (!skipResponse)
   {
-    var response = { type: 'permission_response', granted: granted };
+    var response = runRef({ type: 'permission_response', granted: granted });
     if (!granted && reason) response.reason = reason;
     wsSend(JSON.stringify(response));
   }
@@ -3288,6 +3924,7 @@ function renderChatHistory(history)
       }
       else if (role === 'assistant' && msg.tool_calls)
       {
+         if (content) appendMessage('ai', content, thinking, timeStr, msg.model);
          // Find tool calls and append them
          const calls = msg.tool_calls;
          calls.forEach(c => {

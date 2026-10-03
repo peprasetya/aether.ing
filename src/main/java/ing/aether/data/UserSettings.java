@@ -171,6 +171,40 @@ public class UserSettings
     SessionTracker.unregisterProvider(issSubId, providerKey(name));
   }
 
+  // Web Push subscriptions of the user's browsers ({endpoint, p256dh, auth, created}), one per endpoint
+  @SuppressWarnings("unchecked")
+  public static List<Map<String, Object>> getPushSubscriptions(String issSubId)
+  {
+    Map<String, Object> settings = getSettings(issSubId);
+    List<Map<String, Object>> out = new ArrayList<>();
+    if (settings == null) return out;
+    Object subs = settings.get("pushSubscriptions");
+    Iterable<?> iter = subs instanceof Object[] ? Arrays.asList((Object[]) subs) : subs instanceof Iterable ? (Iterable<?>) subs : null;
+    if (iter != null) for (Object o : iter) if (o instanceof Map) out.add((Map<String, Object>) o);
+    return out;
+  }
+
+  public static synchronized void addPushSubscription(String issSubId, Map<String, Object> sub) throws Exception
+  {
+    Map<String, Object> settings = getSettings(issSubId);
+    if (settings == null) throw new Exception("User settings not loaded (is Google Drive reachable?)");
+    List<Map<String, Object>> subs = getPushSubscriptions(issSubId);
+    subs.removeIf(s -> String.valueOf(s.get("endpoint")).equals(String.valueOf(sub.get("endpoint"))));
+    subs.add(sub);
+    settings.put("pushSubscriptions", subs);
+    save(issSubId);
+  }
+
+  public static synchronized void removePushSubscription(String issSubId, String endpoint)
+  {
+    Map<String, Object> settings = getSettings(issSubId);
+    if (settings == null) return;
+    List<Map<String, Object>> subs = getPushSubscriptions(issSubId);
+    if (!subs.removeIf(s -> String.valueOf(s.get("endpoint")).equals(endpoint))) return;
+    settings.put("pushSubscriptions", subs);
+    try { save(issSubId); } catch (Exception e) { System.out.println("UserSettings: push subscription removal not saved: " + e.getMessage()); }
+  }
+
   @SuppressWarnings("unchecked")
   private static void save(String issSubId) throws Exception
   {

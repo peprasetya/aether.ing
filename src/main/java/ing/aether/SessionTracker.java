@@ -212,7 +212,47 @@ public class SessionTracker implements HttpSessionListener,ServletContextListene
 
   public static HttpSession getSessionById(String sessionId)
   {
-    return sessionMap.get(sessionId);
+    HttpSession s=sessionMap.get(sessionId);
+    if (s!=null)return s;
+    // Agent runs carry their own detached session whose id is the run id (see RunSession)
+    return ing.aether.tools.ai.run.RunManager.getRunSession(sessionId);
+  }
+
+  // A running agent holds a reference like a browser session does, so logging out on the last
+  // device does not drop the user's providers from under a background run
+  public static void pinUser(String issSubId)
+  {
+    if (issSubId==null)return;
+    issSubIdSessions.merge(issSubId,1,Integer::sum);
+  }
+
+  public static void unpinUser(String issSubId)
+  {
+    if (issSubId==null)return;
+    issSubIdSessions.compute(issSubId,(key,count) ->
+    {
+      if (count==null||count<=1)
+      {
+        Map<String, Object> userData=jsonMap.remove(issSubId);
+        if (userData!=null)saveUserJsonData(issSubId,userData);
+        return null;
+      }else return count-1;
+    });
+  }
+
+  // Every live browser session of one account (desktop, phone, ...)
+  public static List<HttpSession> sessionsOf(String issSubId)
+  {
+    List<HttpSession> result=new ArrayList<>();
+    if (issSubId==null)return result;
+    for (HttpSession s:sessionMap.values())
+    {
+      try
+      {
+        if (issSubId.equals(s.getAttribute(Portal.SessionAccountID)))result.add(s);
+      }catch (IllegalStateException e){} // invalidated between listing and reading
+    }
+    return result;
   }
   
   public static Map<String, Object> getSessionData(HttpSession session)
@@ -287,6 +327,7 @@ public class SessionTracker implements HttpSessionListener,ServletContextListene
       if (masterKeyBytes.length*8!=KEY_LENGTH_BITS)  throw new IllegalArgumentException("Master key (from hex) must be "+KEY_LENGTH_BITS+"-bit long.");
       serverMasterKey=new SecretKeySpec(masterKeyBytes,"AES");
       serverSecretSaltForFilenames=filenameSalt;
+      ing.aether.tools.VibedCrypto.init(serverMasterKey,serverSecretSaltForFilenames);
     }catch (IllegalArgumentException e)
     {
       System.err.println("FATAL ERROR: Failed to initialize secure data management components. User data cannot be secured.");
@@ -301,6 +342,8 @@ public class SessionTracker implements HttpSessionListener,ServletContextListene
   public void contextDestroyed(ServletContextEvent sce)
   {
     System.out.println("Application stopped. Cleaning up.");
+    // Park live agent runs first: they flush their logs and release their user pins
+    ing.aether.tools.ai.run.RunManager.shutdown();
     for (Map.Entry<String,Map<String, Object>> entry:jsonMap.entrySet())
     {
       String issSubId=entry.getKey();
@@ -391,12 +434,16 @@ public class SessionTracker implements HttpSessionListener,ServletContextListene
        byte[] encryptedData=byteBuffer.array();
 
        String filename=getFilenameForUser(issSubId)+USER_DATA_FILE_EXTENSION;
-       try (FileOutputStream fos=new FileOutputStream(filename))
+       // Temp file + atomic move: a crash mid-write used to truncate the only copy of the tokens
+       synchronized (filename.intern())
        {
-         fos.write(encryptedData);
-       }catch (IOException e)
-       {
-         e.printStackTrace(System.out);
+         try
+         {
+           ing.aether.tools.VibedCrypto.atomicWrite(new File(filename),encryptedData);
+         }catch (IOException e)
+         {
+           e.printStackTrace(System.out);
+         }
        }
      }catch (NoSuchAlgorithmException|InvalidKeySpecException|NoSuchPaddingException|InvalidKeyException|InvalidAlgorithmParameterException|IllegalBlockSizeException|BadPaddingException e)
      {
@@ -421,11 +468,8 @@ public class SessionTracker implements HttpSessionListener,ServletContextListene
        File userFile=new File(filename);
        if (userFile.exists())
        {
-         byte[] encryptedData=new byte[(int)userFile.length()];
-         try (FileInputStream fis=new FileInputStream(userFile))
-         {
-           fis.read(encryptedData);
-         }
+         // readAllBytes: a single read() may return fewer bytes than the file holds
+         byte[] encryptedData=java.nio.file.Files.readAllBytes(userFile.toPath());
 
          ByteBuffer byteBuffer=ByteBuffer.wrap(encryptedData);
 

@@ -2260,3 +2260,264 @@ dialog::backdrop {
   background-position: 0 0, 0 8px, 8px -8px, -8px 0;
   background-color: #f4f4f4;
 }
+
+/* --- Agent runs (background, cross-device) --- */
+#runs-menu-container {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+#runs-menu-container .explorer-action-btn {
+  position: relative;
+}
+
+.runs-badge {
+  position: absolute;
+  top: -2px;
+  right: -4px;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  border-radius: 7px;
+  background: var(--text-secondary);
+  color: var(--bg-primary);
+  font-size: 0.6rem;
+  line-height: 14px;
+  text-align: center;
+}
+
+.runs-badge.attention,
+.attention-badge {
+  background: #dc2626;
+  color: #fff;
+}
+
+.attention-badge {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  font-size: 0.7rem;
+  line-height: 18px;
+  text-align: center;
+  cursor: pointer;
+  margin-right: 8px;
+}
+
+.runs-dropdown {
+  min-width: 280px;
+  max-width: min(420px, 92vw);
+  max-height: 60vh;
+}
+
+.runs-dropdown-title {
+  padding: 0 1rem 0.5rem 1rem;
+  font-weight: bold;
+  border-bottom: 1px solid var(--border);
+}
+
+#runs-list {
+  overflow-y: auto;
+}
+
+.run-item {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 8px;
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.run-item .run-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-item .run-meta {
+  grid-column: 2;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+
+.run-item .run-actions {
+  grid-column: 1 / span 2;
+}
+
+.run-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.run-empty {
+  padding: 0.75rem 1rem;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+}
+
+.run-chip {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 0.7rem;
+  white-space: nowrap;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  align-self: center;
+}
+
+.run-chip.state-working,
+.run-chip.state-reviewing {
+  background: var(--accent);
+  color: #fff;
+}
+
+.run-chip.state-waiting_input,
+.run-chip.state-parked {
+  background: #d97706;
+  color: #fff;
+}
+
+.run-chip.state-completed {
+  background: #059669;
+  color: #fff;
+}
+
+.run-chip.state-failed {
+  background: #dc2626;
+  color: #fff;
+}
+
+.run-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-secondary);
+  font-size: 0.85rem;
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
+
+.run-banner-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-options {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  font-size: 0.8rem;
+  margin-bottom: 4px;
+}
+
+.task-options .model-select {
+  max-width: 100%;
+}
+
+.decision-block .decision-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 6px 0;
+}
+
+.decision-label {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+
+.decision-edit {
+  width: 100%;
+  min-height: 5em;
+  box-sizing: border-box;
+  font: inherit;
+  font-size: 0.85rem;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px;
+}
+
+.gate-card {
+  font-size: 0.8rem;
+}
+
+.gate-card.gate-fail {
+  border-left: 3px solid #dc2626;
+}
+
+.gate-card.gate-pass {
+  border-left: 3px solid #059669;
+}
+
+.review-card .review-issue,
+.review-card .review-check {
+  font-size: 0.8rem;
+  margin-top: 4px;
+}
+
+.review-issue.sev-high {
+  color: #dc2626;
+}
+
+.review-card.verdict-approve {
+  border-left: 3px solid #059669;
+}
+
+.review-card.verdict-revise,
+.review-card.verdict-blocked {
+  border-left: 3px solid #d97706;
+}
+
+.run-changes-content {
+  width: min(900px, 94vw);
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.run-changes-content .modal-body {
+  overflow: auto;
+}
+
+.diff-view {
+  font-size: 0.75rem;
+  white-space: pre;
+  overflow-x: auto;
+  margin: 8px 0 0 0;
+}
+
+.diff-line-add {
+  background: var(--diff-add);
+}
+
+.diff-line-del {
+  background: var(--diff-del);
+}
+
+.diff-line-hunk {
+  color: var(--accent);
+}
+
+@media (max-width: 768px) {
+  .run-banner .run-actions .p-btn,
+  .decision-block .p-btn,
+  .patch-actions .p-btn,
+  .question-actions .p-btn {
+    min-height: 40px;
+    padding: 0 14px;
+  }
+}

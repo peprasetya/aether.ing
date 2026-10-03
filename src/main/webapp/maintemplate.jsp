@@ -3,6 +3,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no">
 <meta name="application-name" content="Aether">
+<meta name="theme-color" content="#2563eb">
+<link rel="manifest" href="/resources/manifest.json">
+<link rel="apple-touch-icon" href="/images/Aether.ing.png">
 <title>aether.ing</title>
 <%
   java.io.File cssFile = new java.io.File(application.getRealPath("/maintemplate.css"));
@@ -53,6 +56,7 @@
   </div>
   <div class="menu-items">
     <div id="hw-monitor" class="hw-monitor"></div>
+    <span id="run-attention-badge" class="attention-badge hidden" onclick="toggleRunsPanel(event)" title="Agent runs waiting for you"></span>
     <div class="menu-btn" onclick="toggleProfileMenu(event)">
       <div class="ws-status" id="ws-status">
         <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.7 0 5-2.3 5-5s-2.3-5-5-5-5 2.3-5 5 2.3 5 5 5zm0 2c-3.3 0-10 1.7-10 5v3h20v-3c0-3.3-6.7-5-10-5z"/></svg>
@@ -68,6 +72,7 @@
         <div class="dropdown-item" onclick="if(typeof showView === 'function')showView('browser');makeRequest('setup','')">System Setup</div>
         <% } %>
         <% } %>
+        <div class="dropdown-item" onclick="enablePushNotifications()">Enable Notifications</div>
         <div class="dropdown-item logout" onclick="if(typeof clearSessionState==='function')clearSessionState();else clearPanel(true);makeRequest('logout','',false)">Logout</div>
       </div>
       </div>
@@ -148,6 +153,16 @@
         <div id="agent-select-container">
           <select id="agent-select" class="agent-select" onchange="onAgentChange()"></select>
         </div>
+        <div id="runs-menu-container">
+          <button class="explorer-action-btn" onclick="toggleRunsPanel(event)" title="Agent runs (all devices)">
+            <svg viewBox="0 0 24 24"><path d="M13 2.05v2.02c3.95.49 7 3.85 7 7.93 0 3.21-1.92 6-4.72 7.28L13 17v5h5l-1.22-1.22C19.91 19.07 22 15.76 22 12c0-5.18-3.95-9.45-9-9.95zM11 2.05C5.95 2.55 2 6.82 2 12c0 3.76 2.09 7.07 5.22 8.78L6 22h5V2.05zM11 17l-3-3 1.41-1.41L11 14.17V17z"/></svg>
+            <span id="runs-badge" class="runs-badge hidden"></span>
+          </button>
+          <div id="runs-dropdown" class="session-dropdown runs-dropdown" onclick="event.stopPropagation()">
+            <div class="runs-dropdown-title">Agent runs</div>
+            <div id="runs-list"></div>
+          </div>
+        </div>
         <div id="session-menu-container">
           <button class="explorer-action-btn" onclick="toggleSessionMenu(event)" title="Chat History">
             <svg viewBox="0 0 24 24"><path d="M13 3a9 9 0 0 0-9 9H1l3.89 3.89.07.14L9 12H6a7 7 0 1 1 7 7c-1.9 0-3.6-.79-4.83-2.06l-1.42 1.42A8.95 8.95 0 0 0 13 21a9 9 0 0 0 0-18zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z"/></svg>
@@ -165,6 +180,7 @@
       </div>
     </div>
     <div class="chat-container">
+      <div id="run-banner" class="run-banner hidden"></div>
       <div id="todo-card" class="todo-card hidden">
         <div class="todo-header" onclick="toggleTodoCard()">
           <span id="todo-title">📋 Tasks</span>
@@ -209,6 +225,11 @@
           </select>
           <label title="Attach the canvas to chat messages; needs a vision-capable text model"><input type="checkbox" id="image-vision" checked> AI sees image</label>
         </div>
+        <%-- Outside #ai-selectors as well: menu.jsp regenerates that block --%>
+        <div id="task-options" class="task-options hidden">
+          <label title="The AI proposes a Definition of Done and a todo list; it starts working after you approve"><input type="checkbox" id="task-plan-gate" checked> Approve plan first</label>
+          <select id="task-reviewer-select" class="model-select" title="Model that reviews the work before the task may finish"></select>
+        </div>
         <div id="ai-status" class="ai-status hidden"></div>
         <div class="prompt-btns" id="agent-commands">
           <!-- Agent specific buttons will be populated here -->
@@ -230,6 +251,7 @@
         <div class="chat-input-area">
           <textarea class="chat-input" id="chat-input" placeholder="Ask AI..."></textarea>
           <button class="send-btn" id="send-btn" onclick="sendChatMessage()">➤</button>
+          <button class="send-btn hidden" id="steer-interrupt-btn" onclick="sendSteerInterrupt()" title="Interrupt the current answer and apply this message now">⚡</button>
           <button class="send-btn hidden" id="stop-btn" onclick="stopAiActivity()" title="Stop AI">⏹</button>
         </div>
       </div>
@@ -260,7 +282,20 @@
     </div>
     <div class="buttonContainer">
       <button class="cancel-btn" onclick="respondPermission(false)">Deny</button>
+      <button class="save-btn hidden" id="permission-always-btn" onclick="respondPermission(true, true)" title="Allow, and let this run use the same tool without asking again">Always (this run)</button>
       <button class="save-btn" onclick="respondPermission(true)">Allow</button>
+    </div>
+  </div>
+</div>
+
+<div id="run-changes-modal" class="modal hidden" onclick="if(event.target===this)this.classList.add('hidden')">
+  <div class="modal-content run-changes-content">
+    <div class="modal-header">
+      <h3>Changes made by this run</h3>
+    </div>
+    <div class="modal-body" id="run-changes-body"></div>
+    <div class="buttonContainer">
+      <button class="cancel-btn" onclick="document.getElementById('run-changes-modal').classList.add('hidden')">Close</button>
     </div>
   </div>
 </div>
@@ -326,11 +361,14 @@ function toggleProfileMenu(event) {
 window.addEventListener('click', () => {
   const dropdown = document.getElementById('profile-dropdown');
   if (dropdown) dropdown.classList.remove('show');
+  const runs = document.getElementById('runs-dropdown');
+  if (runs) runs.classList.remove('show');
 });
 
 <% if (bean.getAccount()==null) { %>
 makeRequest('welcome','');
 <% } else { %>
+window.aetherVapidKey = "<%=ing.aether.tools.push.WebPush.publicKey()%>";
 initAppState();
 <% } %>
 </script>

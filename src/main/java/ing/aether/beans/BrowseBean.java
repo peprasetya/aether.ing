@@ -59,6 +59,8 @@ public class BrowseBean extends BeanObject implements Comparator<Object>
           List<Map<String, Object>> history = ing.aether.tools.ai.AgentWorker.loadLatestSession(session);
           if (history != null) session.setAttribute("chatHistory", history);
           ing.aether.tools.ai.AgentWorker.broadcastChatHistory(session, history);
+          // This browser now shows another project's chat: resync its run banner and replay state
+          ing.aether.tools.ai.run.RunManager.viewChanged(session);
           
           // Refresh bean's local state after session update
           loadAIData();

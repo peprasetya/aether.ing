@@ -81,6 +81,7 @@
         <div class="dropdown-item" onclick="if(typeof showView === 'function')showView('browser');makeRequest('setup','')">System Setup</div>
         <% } %>
         <% } %>
+        <div class="dropdown-item" onclick="enablePushNotifications()">Enable Notifications</div>
         <div class="dropdown-item logout" onclick="if(typeof clearSessionState==='function')clearSessionState();else clearPanel(true);makeRequest('logout','',false)">Logout</div>
       </div>
 </replacehtml>

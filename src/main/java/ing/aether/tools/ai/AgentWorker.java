@@ -18,6 +18,10 @@ import ing.aether.data.FileProvider;
 import ing.aether.data.GoogleDriveProvider;
 import ing.aether.data.PathMap;
 import ing.aether.socket.AetherWebSocket;
+import ing.aether.tools.ai.run.AgentRun;
+import ing.aether.tools.ai.run.RunManager;
+import ing.aether.tools.ai.run.RunPolicy;
+import ing.aether.tools.ai.run.StopGates;
 import jakarta.servlet.http.HttpSession;
 
 public class AgentWorker
@@ -56,7 +60,7 @@ public class AgentWorker
 
   // Guard against runaway tool loops: total LLM rounds per user turn (main and sub-agent turns share the budget)
   private static final Map<String, Integer> activeAiRounds = new ConcurrentHashMap<>();
-  private static final int MAX_ROUNDS = 40;
+  public static final int MAX_ROUNDS = 40;
 
   // Reality audit for todo-capable agents: weak models claim work is done without executing anything.
   // The server keeps a per-turn ledger of tools that actually ran and checks completion claims against it.
@@ -75,40 +79,79 @@ public class AgentWorker
   // Flattened canvas attached to this turn's user message for vision-capable models (image agents)
   private static final Map<String, String> turnImages = new ConcurrentHashMap<>();
 
-  public static void handlePermission(String httpSessionId, boolean granted)
+  public static boolean handlePermission(String httpSessionId, boolean granted)
   {
-    handlePermission(httpSessionId, granted, null);
+    return handlePermission(httpSessionId, granted, null, false);
   }
 
-  public static void handlePermission(String httpSessionId, boolean granted, String reason)
+  // Any device of the owner may answer; the first answer wins and every device drops its card
+  public static boolean handlePermission(String httpSessionId, boolean granted, String reason, boolean always)
   {
     SynchronousQueue<Object[]> queue = permissionQueues.get(httpSessionId);
-    if (queue != null)
+    if (queue == null) return false;
+    // Bounded offer: put() would block this WebSocket thread forever if the waiting AI thread is already gone
+    try
     {
-      // Bounded offer: put() would block this WebSocket thread forever if the waiting AI thread is already gone
-      try
+      if (!queue.offer(new Object[] { granted, reason, always }, 500, TimeUnit.MILLISECONDS))
       {
-        if (!queue.offer(new Object[] { granted, reason }, 3, TimeUnit.SECONDS)) System.out.println("AgentWorker: Permission answer dropped, no waiting tool call for session " + httpSessionId);
-      } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-    }
+        System.out.println("AgentWorker: Permission answer dropped, no waiting tool call for session " + httpSessionId);
+        return false;
+      }
+    } catch (InterruptedException e) { Thread.currentThread().interrupt(); return false; }
+    AetherWebSocket.sendToSession(httpSessionId, Map.of("type", "approval_resolved", "kind", "permission", "granted", granted));
+    return true;
   }
 
-  public static void handleQuestionAnswers(String httpSessionId, Object answers)
+  public static boolean handleQuestionAnswers(String httpSessionId, Object answers)
   {
     SynchronousQueue<Object> queue = questionQueues.get(httpSessionId);
-    if (queue != null)
+    if (queue == null) return false;
+    // Bounded offer: put() would block this WebSocket thread forever if the waiting AI thread is already gone
+    try
     {
-      // Bounded offer: put() would block this WebSocket thread forever if the waiting AI thread is already gone
-      try
+      if (!queue.offer(answers != null ? answers : new Object[0], 500, TimeUnit.MILLISECONDS))
       {
-        if (!queue.offer(answers != null ? answers : new Object[0], 3, TimeUnit.SECONDS)) System.out.println("AgentWorker: Question answers dropped, no waiting tool call for session " + httpSessionId);
-      } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-    }
+        System.out.println("AgentWorker: Question answers dropped, no waiting tool call for session " + httpSessionId);
+        return false;
+      }
+    } catch (InterruptedException e) { Thread.currentThread().interrupt(); return false; }
+    AetherWebSocket.sendToSession(httpSessionId, Map.of("type", "approval_resolved", "kind", "question"));
+    return true;
+  }
+
+  // Resolves "agentId" or "agentId:commandId" to its agent definition
+  public static Agent findAgent(String agentRef)
+  {
+    if (agentRef == null || agentRef.isEmpty()) return agents.get("general");
+    String id = agentRef.contains(":") ? agentRef.substring(0, agentRef.indexOf(':')) : agentRef;
+    return agents.get(id);
+  }
+
+  // "Interrupt now" steer: closing the response stream ends the model's current answer immediately;
+  // a tool that is running is never touched (the steer is applied after the batch)
+  public static void abortStream(String runId)
+  {
+    InputStream s = activeAiStreams.get(runId);
+    if (s != null) try { s.close(); } catch (Exception ignore) {}
+  }
+
+  public static String repairJson(String text)
+  {
+    return extractAndFixJson(text);
+  }
+
+  public static boolean hasLiveThread(String id)
+  {
+    Thread t = activeAiThreads.get(id);
+    return t != null && t.isAlive();
   }
 
   public static boolean isProcessing(String httpSessionId)
   {
-    return activeAiThreads.containsKey(httpSessionId);
+    if (activeAiThreads.containsKey(httpSessionId)) return true;
+    // A browser session counts as busy while a run works on the chat it shows
+    HttpSession s = SessionTracker.getSessionById(httpSessionId);
+    return s != null && RunManager.activeRunForSession(s) != null;
   }
 
   public static void interruptProcessing(String httpSessionId)
@@ -125,7 +168,7 @@ public class AgentWorker
     InputStream s = activeAiStreams.remove(httpSessionId);
     if (s != null) try { s.close(); } catch (Exception ignore) {}
     // Also release any waiting permissions with 'false'
-    handlePermission(httpSessionId, false);
+    handlePermission(httpSessionId, false, null, false);
     // And any waiting askUser question with empty answers
     handleQuestionAnswers(httpSessionId, null);
   }
@@ -195,16 +238,10 @@ public class AgentWorker
     }
     entry.put("doneTime", System.currentTimeMillis());
     history.add(entry);
-    int count = 0;
-    for (Map<String, Object> m : history) if ("command".equals(m.get("role"))) count++;
-    for (Iterator<Map<String, Object>> it = history.iterator(); it.hasNext() && count > MAX_COMMAND_ENTRIES;)
-    {
-      if ("command".equals(it.next().get("role")))
-      {
-        it.remove();
-        count--;
-      }
-    }
+    // Collected first: a run's history is a copy-on-write list whose iterator cannot remove
+    List<Map<String, Object>> commands = new ArrayList<>();
+    for (Map<String, Object> m : history) if ("command".equals(m.get("role"))) commands.add(m);
+    for (int i = 0; i < commands.size() - MAX_COMMAND_ENTRIES; i++) history.remove(commands.get(i));
     saveChatSession(session, history);
   }
 
@@ -239,6 +276,19 @@ public class AgentWorker
         agent.setName((String) map.get("name"));
         agent.setPrompt((String) map.get("prompt"));
         agent.setImage(Boolean.TRUE.equals(map.get("image")));
+        agent.setBehavior((String) map.get("behavior"));
+        if (map.get("reviewer") instanceof Map) agent.setReviewerModel((String) ((Map<String, Object>) map.get("reviewer")).get("model"));
+        if (map.get("budget") instanceof Map) agent.setBudget((Map<String, Object>) map.get("budget"));
+        if (map.get("stopGates") instanceof Map) agent.setStopGates((Map<String, Object>) map.get("stopGates"));
+        if (map.get("planGate") instanceof Boolean) agent.setPlanGate((Boolean) map.get("planGate"));
+        Object policyObj = map.get("policy");
+        Iterable<?> policyIter = policyObj instanceof Object[] ? Arrays.asList((Object[]) policyObj) : policyObj instanceof Iterable ? (Iterable<?>) policyObj : null;
+        if (policyIter != null)
+        {
+          List<Map<String, Object>> rules = new ArrayList<>();
+          for (Object o : policyIter) if (o instanceof Map) rules.add((Map<String, Object>) o);
+          agent.setPolicy(rules);
+        }
         
         Object toolsObj = map.get("tools");
         if (toolsObj instanceof Object[]) agent.setTools(Arrays.asList(Arrays.copyOf((Object[])toolsObj, ((Object[])toolsObj).length, String[].class)));
@@ -363,6 +413,19 @@ public class AgentWorker
     // whenever a file is added or renamed, so it moved down into the volatile tail of the context turn.
     // Last in the system prompt on purpose: these are the rules the model must weigh against a
     // whole file sitting in front of it, so they take the closest position to the conversation
+    // Autonomous task runs: the stop-gate protocol and the plan gate setting of THIS run
+    AgentRun run = RunManager.get(session.getId());
+    if (run != null && run.isAutonomous())
+    {
+      sbSystem.append("\n\n# Task run protocol (server-enforced)\nYou run autonomously in the background; the user may be away and follows along on any device.");
+      sbSystem.append("\n- Start by calling proposePlan with a Definition of Done (verifiable acceptance criteria) and the todo list. ").append(run.planGate ? "The user must APPROVE the plan before you execute: proposePlan waits for their decision." : "The plan is recorded without waiting for approval.");
+      sbSystem.append("\n- The task is only complete when you call finish and ALL stop gates pass: every todo done, the project's verify command succeeds, and the reviewer model approves. A failed gate returns its reasons: fix them and call finish again.");
+      sbSystem.append("\n- Ending your reply without calling finish does NOT end the task: you will be asked to continue.");
+      sbSystem.append("\n- The user may send new messages while you work. They appear as user messages marked as sent during your work: acknowledge them in one sentence and adapt the plan and todo list.");
+      if (agent.getTools() != null && agent.getTools().contains("delegate")) sbSystem.append("\n- Delegate isolated chunks to worker agents with delegate; keep small edits yourself.");
+      StopGates.captureGitBase(session, run);
+    }
+
     String projectMd = contextMap.get("AGENTS.MD");
     if (projectMd != null && !projectMd.isEmpty()) sbSystem.append("\n\nProject Overview (AGENTS.md) — authoritative project rules. Follow them in every response. When the user asks about the project's rules, conventions or writing style, answer from this document and quote it.\n").append(projectMd);
 
@@ -602,7 +665,7 @@ public class AgentWorker
       {
         activeAiThreads.remove(httpSessionId, Thread.currentThread());
       }
-    });
+    }, RunManager.AI_EXECUTOR);
   }
 
   // Tool entry point for generateImage / editImage: the model's arguments override the user's pane settings
@@ -798,6 +861,16 @@ public class AgentWorker
     }
     else session.removeAttribute("todoList");
 
+    // A chat that a run is working on right now is shown from the run's live list, not the saved copy
+    List<Map<String, Object>> live = RunManager.liveHistory((String) session.getAttribute(Portal.SessionAccountID), (String) session.getAttribute("workingDirectory"), (String) sessionMap.get("id"));
+    if (live != null)
+    {
+      HttpSession runSession = RunManager.getRunSession(RunManager.activeRunFor((String) session.getAttribute(Portal.SessionAccountID), (String) session.getAttribute("workingDirectory"), (String) sessionMap.get("id")).runId);
+      Object liveTodos = runSession != null ? runSession.getAttribute("todoList") : null;
+      if (liveTodos != null) session.setAttribute("todoList", liveTodos);
+      session.setAttribute("chatHistory", live);
+      return live;
+    }
     Object[] historyArr = (Object[]) sessionMap.get("history");
     List<Map<String, Object>> history = new ArrayList<>();
     if (historyArr != null) for (Object h : historyArr) history.add((Map<String, Object>) h);
@@ -860,12 +933,7 @@ public class AgentWorker
   @SuppressWarnings("unchecked")
   public static void switchSession(HttpSession session, String sessionId)
   {
-    String httpSessionId = session.getId();
-    if (isProcessing(httpSessionId))
-    {
-      AetherWebSocket.notify(httpSessionId, "Cannot switch chats while the AI is working.");
-      return;
-    }
+    // Allowed while a run works: the run owns a detached session and keeps going on its own chat
     String workingDir = (String) session.getAttribute("workingDirectory");
     if (workingDir == null || sessionId == null) return;
 
@@ -906,9 +974,9 @@ public class AgentWorker
 
     String currentId = (String) session.getAttribute("currentChatSessionId");
     boolean deletingCurrent = sessionId.equals(currentId);
-    if (deletingCurrent && isProcessing(httpSessionId))
+    if (RunManager.activeRunFor((String) session.getAttribute(Portal.SessionAccountID), workingDir, sessionId) != null)
     {
-      AetherWebSocket.notify(httpSessionId, "Cannot delete the active chat while the AI is working.");
+      AetherWebSocket.notify(httpSessionId, "Cannot delete a chat while the AI is working in it. Stop the run first.");
       return;
     }
 
@@ -943,13 +1011,13 @@ public class AgentWorker
   public static void clearAllSessions(HttpSession session)
   {
     String httpSessionId = session.getId();
-    if (isProcessing(httpSessionId))
-    {
-      AetherWebSocket.notify(httpSessionId, "Cannot clear chats while the AI is working.");
-      return;
-    }
     String workingDir = (String) session.getAttribute("workingDirectory");
     if (workingDir == null) return;
+    if (RunManager.hasActiveRunInWd((String) session.getAttribute(Portal.SessionAccountID), workingDir))
+    {
+      AetherWebSocket.notify(httpSessionId, "Cannot clear chats while the AI is working in this project. Stop the running tasks first.");
+      return;
+    }
 
     String sessionId = UUID.randomUUID().toString();
     session.setAttribute("currentChatSessionId", sessionId);
@@ -1296,11 +1364,15 @@ public class AgentWorker
       InputStream bodyStream = null;
       try
       {
-        // Runaway-loop guard: each LLM round consumes from the per-turn budget shared with sub-agents
+        // Round boundary: apply a pause and the user's steering messages before the next model call
+        if (includeHistory && RunManager.isRun(httpSessionId) && RunManager.drainSteers(httpSessionId, history) > 0) saveChatSession(session, history);
+
+        // Runaway-loop guard: each LLM round consumes from the per-run budget shared with sub-agents;
+        // a run asks the user (on any device) whether to extend it instead of just failing
         int rounds = activeAiRounds.merge(httpSessionId, 1, Integer::sum);
-        if (rounds > MAX_ROUNDS)
+        if (rounds > roundLimit(httpSessionId) && !requestMoreRounds(httpSessionId, rounds - 1))
         {
-          AetherWebSocket.sendToSession(httpSessionId, Map.of("type", "chat_error", "error", "Round limit (" + MAX_ROUNDS + ") reached — stopping the tool loop to protect against a runaway turn."));
+          AetherWebSocket.sendToSession(httpSessionId, Map.of("type", "chat_error", "error", "Round limit (" + roundLimit(httpSessionId) + ") reached — stopping the tool loop to protect against a runaway turn."));
           finishCommand(session, httpSessionId, null, "Round limit reached");
           AetherWebSocket.sendToSession(httpSessionId, Map.of("type", "chat_done", "responseType", responseType != null ? responseType : "chat"));
           return;
@@ -1344,6 +1416,8 @@ public class AgentWorker
           Map<String, Object> msg = new HashMap<>();
           msg.put("role", role);
           msg.put("content", m.get("content") != null ? m.get("content") : "");
+          // Steers arrive while the model works: labelled so it treats them as an update, not a new task
+          if (Boolean.TRUE.equals(m.get("steer"))) msg.put("content", "[Message from the user, sent while you were working. Acknowledge it in one sentence, then adapt your plan and todo list if needed.]\n" + msg.get("content"));
           if (m.containsKey("tool_calls")) msg.put("tool_calls", toOpenAiToolCalls(m.get("tool_calls")));
           if ("tool".equals(role))
           {
@@ -1351,9 +1425,11 @@ public class AgentWorker
             if (m.get("tool_call_id") != null) msg.put("tool_call_id", m.get("tool_call_id"));
             else { msg.put("role", "user"); msg.put("content", "Tool result: " + msg.get("content")); }
           }
-          if ("user".equals(role)) lastUserIdx = messages.size();
+          // The expanded prompt belongs to the turn's own message, never to a steer sent later
+          if ("user".equals(role) && !Boolean.TRUE.equals(m.get("steer"))) lastUserIdx = messages.size();
           messages.add(msg);
         }
+        compactToolOutputs(messages);
         // The expanded prompt replaces the latest user message IN PLACE so tool results stay last.
         // Appending it after tool rounds made the model see a fresh user request and restart the task.
         if (lastUserIdx >= 0) messages.get(lastUserIdx).put("content", userPrompt);
@@ -1698,6 +1774,30 @@ public class AgentWorker
                 }
               }
 
+              // A message the user sent while the final answer streamed must not be lost: continue
+              if (includeHistory && "chat".equals(responseType) && RunManager.hasPendingSteers(httpSessionId))
+              {
+                streamOllama(session, model, thinkingMode, systemPrompt, contextBlock, userPrompt, history, responseType, responseTarget, toolNames, includeHistory);
+                return;
+              }
+
+              // Autonomous task runs only end through finish + passing stop gates
+              AgentRun taskRun = RunManager.get(httpSessionId);
+              if (taskRun != null && taskRun.isAutonomous() && includeHistory && "chat".equals(responseType) && !taskRun.finished && taskRun.continuations < taskRun.maxContinuations)
+              {
+                taskRun.continuations++;
+                Map<String, Object> note = new HashMap<>();
+                note.put("type", "chat_delta");
+                note.put("content", "\n\n⚙️ *Task not finished (no successful finish call) — continuing (" + taskRun.continuations + "/" + taskRun.maxContinuations + ").*\n");
+                note.put("thinking", "");
+                note.put("responseType", responseType);
+                note.put("model", modelName);
+                AetherWebSocket.sendToSession(httpSessionId, note);
+                String nudge = "AUTO-CONTINUE (server, not the user): you ended your reply without completing the task. Continue working on the next unfinished todo item with real tool calls. When everything is done and verified, call finish. If you are blocked, call askUser.";
+                streamOllama(session, model, thinkingMode, systemPrompt, contextBlock, userPrompt + "\n\n" + nudge, history, responseType, responseTarget, toolNames, includeHistory);
+                return;
+              }
+
               if (includeHistory) generateTitleIfNeeded(session, history);
               // Always close the turn so the client leaves the working state, even for an empty response.
               // Turn complete and delivered live: drop the replay buffer so reconnects don't re-feed stats/deltas
@@ -1706,6 +1806,13 @@ public class AgentWorker
         }
       } catch (Exception e)
       {
+        // "Interrupt now" steer: the stream was closed on purpose — restart the round with the message applied
+        if (!Thread.currentThread().isInterrupted() && RunManager.consumeInterrupt(httpSessionId))
+        {
+          AetherWebSocket.sendToSession(httpSessionId, Map.of("type", "chat_delta", "content", "\n\n⏸️ *Interrupted to apply your message.*\n", "thinking", "", "responseType", "chat"));
+          streamOllama(session, model, thinkingMode, systemPrompt, contextBlock, userPrompt, history, responseType, responseTarget, toolNames, includeHistory);
+          return;
+        }
         // A user stop arrives as an interrupt or as the response stream being closed under us: end quietly
         boolean stopped = Thread.currentThread().isInterrupted() || e instanceof InterruptedException || e.getCause() instanceof InterruptedException;
         if (!stopped)
@@ -1719,7 +1826,53 @@ public class AgentWorker
         if (bodyStream != null) activeAiStreams.remove(httpSessionId, bodyStream);
         activeAiThreads.remove(httpSessionId, Thread.currentThread());
       }
-    });
+    }, RunManager.AI_EXECUTOR);
+  }
+
+  private static int roundLimit(String id)
+  {
+    AgentRun run = RunManager.get(id);
+    return run != null && run.roundLimit > 0 ? run.roundLimit : MAX_ROUNDS;
+  }
+
+  // Budget exhausted: park on the run's thread and let any of the user's devices extend it
+  private static boolean requestMoreRounds(String id, int used) throws InterruptedException
+  {
+    AgentRun run = RunManager.get(id);
+    if (run == null) return false;
+    Map<String, Object> req = new HashMap<>();
+    req.put("type", "budget_request");
+    req.put("used", used);
+    req.put("limit", run.roundLimit);
+    req.put("message", "The run used its budget of " + run.roundLimit + " model calls. Extend it to let the AI continue?");
+    Map<String, Object> answer = RunManager.awaitDecision(run, req);
+    int extra = answer.get("extend") instanceof Number ? ((Number) answer.get("extend")).intValue() : 0;
+    if (extra <= 0) return false;
+    run.roundLimit += extra;
+    return true;
+  }
+
+  // Long task runs outgrow the context: older tool outputs are replaced by a stub in the REQUEST only
+  // (history and log keep everything). Applied only past a threshold, so short chats keep a stable
+  // prefix for the KV cache.
+  private static final int COMPACT_CHARS = 160000;
+  private static final int KEEP_RECENT_TOOL_OUTPUTS = 8;
+
+  private static void compactToolOutputs(List<Map<String, Object>> messages)
+  {
+    long total = 0;
+    for (Map<String, Object> m : messages) if (m.get("content") instanceof String) total += ((String) m.get("content")).length();
+    if (total <= COMPACT_CHARS) return;
+    int toolSeen = 0;
+    for (int i = messages.size() - 1; i >= 0; i--)
+    {
+      Map<String, Object> m = messages.get(i);
+      if (!"tool".equals(m.get("role"))) continue;
+      toolSeen++;
+      if (toolSeen <= KEEP_RECENT_TOOL_OUTPUTS) continue;
+      Object c = m.get("content");
+      if (c instanceof String && ((String) c).length() > 400) m.put("content", "[Older tool output cleared to save context (" + ((String) c).length() + " chars). Re-run the tool if you need it again.]");
+    }
   }
 
   // Rough prompt size for the status line: about four characters per token
@@ -1981,6 +2134,24 @@ public class AgentWorker
           properties.put("name", Map.of("type", "string", "description", "Short file-name hint."));
           required.add("prompt");
           break;
+        case "delegate":
+          function.put("description", "Delegate ONE self-contained chunk of the task to a worker agent with its own fresh context (it cannot see this conversation). It reads, searches and edits files (edits follow the same approval rules) and returns a report of what it did and changed. Give it everything it needs: file paths, requirements, conventions, and what 'done' means for this chunk. Keep small edits yourself.");
+          properties.put("agent", Map.of("type", "string", "description", "Worker agent id, e.g. 'coder'. Defaults to the current agent."));
+          properties.put("task", Map.of("type", "string", "description", "Complete standalone instructions for the worker."));
+          required.add("task");
+          break;
+        case "proposePlan":
+          function.put("description", "Record the plan of this task: a Definition of Done (verifiable acceptance criteria the reviewer will check) and the ordered todo list. When plan approval is on, this waits for the user to approve, edit or reject it; follow the returned plan.");
+          properties.put("dod", Map.of("type", "array", "items", Map.of("type", "string"), "description", "Acceptance criteria, each concrete and checkable."));
+          properties.put("todos", Map.of("type", "array", "items", Map.of("type", "string"), "description", "Ordered, concrete todo items."));
+          properties.put("summary", Map.of("type", "string", "description", "One paragraph: the approach and why."));
+          required.addAll(Arrays.asList("dod", "todos"));
+          break;
+        case "finish":
+          function.put("description", "Declare the task complete. The server then runs the stop gates: all todos done, the project's verify command (build/tests) passes, and the reviewer model approves the changes against the Definition of Done. Returns PASSED (then write the final summary) or the reasons it FAILED (fix them and call finish again).");
+          properties.put("summary", Map.of("type", "string", "description", "What was done and how it was verified, file by file."));
+          required.add("summary");
+          break;
         case "askUser":
           function.put("description", "Ask the user one or more questions when you need clarification, missing information, or a decision. Do NOT guess when the request is ambiguous — call this tool first. Bundle SEVERAL related questions into a SINGLE call so the user answers them all at once. Give each question 2-4 suggested answers as options; the user can pick one or type a completely free answer. Returns the user's answers.");
           properties.put("questions", Map.of(
@@ -2083,6 +2254,9 @@ public class AgentWorker
         case "renameFile": logAction = "✏️ Renaming: " + pathArg + " → " + args.get("new_name"); break;
         case "moveFile": logAction = "📦 Moving: " + pathArg + " → " + args.get("destination"); break;
         case "copyFile": logAction = "📄 Copying: " + pathArg + " → " + args.get("destination"); break;
+        case "delegate": logAction = "🤖 Delegating to " + (args.get("agent") != null ? args.get("agent") : "a worker") + ": " + shortText(args.get("task"), 80); break;
+        case "proposePlan": logAction = "🗺️ Proposing the plan"; break;
+        case "finish": logAction = "🏁 Checking the stop gates"; break;
       }
 
       Map<String, Object> toolCallMsg = new HashMap<>();
@@ -2106,7 +2280,11 @@ public class AgentWorker
           throw new Exception("Rejected by system: file '" + pathArg + "' already exists. Use the patchFile tool to modify it instead. Current content of the file:\n" + existing);
         }
 
-        if ("writeFile".equals(name) || "patchFile".equals(name) || "createFile".equals(name) || "deleteFile".equals(name) || "mkdir".equals(name) || "runCommand".equals(name) || "renameFile".equals(name) || "moveFile".equals(name) || "copyFile".equals(name))
+        // Declarative policy first (agent rules, "always allow" answers of this run, writes outside the
+        // project); without rules every mutating tool asks, exactly as before
+        String decision = RunPolicy.decide(session, name, pathArg);
+        if (RunPolicy.DENY.equals(decision)) throw new Exception("Denied by the agent's tool policy: " + name + (pathArg != null ? " on " + pathArg : "") + " is not allowed. Choose another approach or ask the user.");
+        if (RunPolicy.ASK.equals(decision))
         {
           // Register the queue BEFORE asking the UI, so an instant answer cannot be lost
           SynchronousQueue<Object[]> queue = new SynchronousQueue<>();
@@ -2118,12 +2296,16 @@ public class AgentWorker
           req.put("args", args);
           req.put("message", logAction); // Pass the descriptive message for consent
           if (depth > 0) req.put("sub", true);
+          if (RunManager.isRun(httpSessionId)) req.put("canAlways", true);
           // Authoritative server-side path resolution so the client opens the right file for review
           if (pathArg != null) req.put("fullpath", AITools.resolveFullPath(session, pathArg));
           AetherWebSocket.sendToSession(httpSessionId, req);
 
           try {
-            Object[] answer = queue.take(); // Blocks until UI responds
+            Object[] answer = queue.take(); // Blocks until UI responds (a parked virtual thread in a run)
+            // "Always allow for this run": later calls of the same tool skip the prompt
+            AgentRun permRun = RunManager.get(httpSessionId);
+            if (permRun != null && Boolean.TRUE.equals(answer[0]) && answer.length > 2 && Boolean.TRUE.equals(answer[2])) permRun.alwaysAllow.add(name);
             if (!Boolean.TRUE.equals(answer[0]))
             {
               String reason = answer[1] instanceof String ? ((String) answer[1]).trim() : null;
@@ -2177,6 +2359,9 @@ public class AgentWorker
           case "todoWrite": result = todoWrite(session, args); break;
           case "runCommand": result = AITools.runCommand(session, (String)args.get("command"), asInt(args.get("timeout_seconds"))); break;
           case "subTask": result = runSubAgent(session, httpSessionId, model, thinkingMode, args); break;
+          case "delegate": result = runSubAgent(session, httpSessionId, model, thinkingMode, delegateArgs(args)); break;
+          case "proposePlan": result = proposePlan(session, httpSessionId, args); break;
+          case "finish": result = StopGates.finish(session, httpSessionId, args); break;
           case "generateImage": case "editImage": result = runImageTool(session, httpSessionId, name, args); break;
         }
       }
@@ -2194,6 +2379,21 @@ public class AgentWorker
       {
         turnToolLedger.computeIfAbsent(httpSessionId, k -> Collections.synchronizedList(new ArrayList<>())).add(name + (toolError ? "(failed)" : ""));
         if (!toolError) actionsSinceTodoWrite.merge(httpSessionId, 1, Integer::sum);
+      }
+
+      AgentRun toolRun = RunManager.get(httpSessionId);
+      if (toolRun != null)
+      {
+        // What the run changed, for the reviewer and the Changes view
+        if (!toolError && pathArg != null && RunPolicy.isMutating(name) && !"runCommand".equals(name)) toolRun.changedFiles.add(AITools.resolveFullPath(session, pathArg));
+        if (!toolError && args.get("destination") instanceof String) toolRun.changedFiles.add(AITools.resolveFullPath(session, (String) args.get("destination")));
+        // Stuck detection: the same failing call three times means retrying will not help
+        if (toolError)
+        {
+          String key = name + "|" + String.valueOf(args.get("path")) + "|" + String.valueOf(args.get("command")) + "|" + (result.length() > 120 ? result.substring(0, 120) : result);
+          int n = toolRun.errorCounts.merge(key, 1, Integer::sum);
+          if (n >= 3) result += "\n\nSTUCK: this exact call has now failed " + n + " times. Do not retry it again. Call askUser and explain in one sentence why you are stuck and what you need.";
+        }
       }
 
       Map<String, Object> toolResultMsg = new HashMap<>();
@@ -2422,6 +2622,9 @@ public class AgentWorker
 
     List<String> subTools = target.getTools() != null ? new ArrayList<>(target.getTools()) : new ArrayList<>();
     subTools.remove("subTask"); // hard depth limit: a sub-agent cannot delegate further
+    subTools.remove("delegate");
+    subTools.remove("finish");
+    subTools.remove("proposePlan");
     if (subTools.contains("runCommand") && !AITools.isSshWorkingDir(session)) subTools.remove("runCommand");
 
     List<Map<String, Object>> subHistory = new ArrayList<>();
@@ -2436,6 +2639,7 @@ public class AgentWorker
       int total = activeAiRounds.merge(httpSessionId, 1, Integer::sum);
       if (total > MAX_ROUNDS) return "Sub-task aborted: the turn's total round limit (" + MAX_ROUNDS + ") was reached.";
 
+      RunManager.forwardSteersToSub(httpSessionId, subHistory);
       Object[] toolCalls = subTurn(httpSessionId, model, thinkingMode, systemPrompt, subTools, subHistory);
       if (toolCalls.length == 0)
       {
@@ -2696,5 +2900,68 @@ public class AgentWorker
         config.put("personality", personality);
       });
     } catch (Exception e) { e.printStackTrace(); }
+  }
+
+  private static String shortText(Object o, int max)
+  {
+    String t = o != null ? String.valueOf(o) : "";
+    return t.length() > max ? t.substring(0, max) + "…" : t;
+  }
+
+  // delegate{agent, task} is subTask{agent, prompt, description} with a clearer contract for managers
+  private static Map<String, Object> delegateArgs(Map<String, Object> args)
+  {
+    Map<String, Object> sub = new HashMap<>();
+    sub.put("prompt", args.get("task"));
+    sub.put("description", shortText(args.get("task"), 60));
+    if (args.get("agent") instanceof String) sub.put("agent", args.get("agent"));
+    return sub;
+  }
+
+  // proposePlan tool: records the Definition of Done and the todo list; with the run's plan gate on it
+  // waits until the user approves, edits or rejects the plan on any device
+  @SuppressWarnings("unchecked")
+  private static String proposePlan(HttpSession session, String httpSessionId, Map<String, Object> args) throws Exception
+  {
+    List<String> dod = stringList(args.get("dod"));
+    List<String> items = stringList(args.get("todos"));
+    AgentRun run = RunManager.get(httpSessionId);
+    if (run != null && run.planGate)
+    {
+      Map<String, Object> req = new HashMap<>();
+      req.put("type", "plan_request");
+      req.put("dod", dod);
+      req.put("todos", items);
+      req.put("summary", args.get("summary") != null ? args.get("summary") : "");
+      Map<String, Object> answer = RunManager.awaitDecision(run, req);
+      String decision = String.valueOf(answer.get("decision"));
+      if ("reject".equals(decision)) return "The user REJECTED the plan" + (answer.get("note") != null ? ": " + answer.get("note") : ".") + " Revise it and call proposePlan again.";
+      if (answer.get("dod") != null) dod = stringList(answer.get("dod"));
+      if (answer.get("todos") != null) items = stringList(answer.get("todos"));
+      if (answer.get("note") instanceof String && !((String) answer.get("note")).trim().isEmpty()) dod.add("User note: " + answer.get("note"));
+    }
+    if (run != null) run.definitionOfDone = dod;
+    List<Map<String, Object>> todos = new ArrayList<>();
+    for (int i = 0; i < items.size(); i++)
+    {
+      Map<String, Object> t = new HashMap<>();
+      t.put("id", "t" + (i + 1));
+      t.put("content", items.get(i));
+      t.put("status", i == 0 ? "in_progress" : "pending");
+      todos.add(t);
+    }
+    session.setAttribute("todoList", todos);
+    saveTodos(session, todos);
+    broadcastTodos(session);
+    actionsSinceTodoWrite.put(httpSessionId, 0);
+    return "Plan " + (run != null && run.planGate ? "APPROVED by the user" : "recorded") + ".\nDefinition of Done:\n- " + String.join("\n- ", dod) + "\nTodo list (ids t1..t" + todos.size() + ", first item now in_progress):\n- " + String.join("\n- ", items) + "\nExecute it item by item; keep the todo list current with todoWrite; call finish when everything is done and verified.";
+  }
+
+  private static List<String> stringList(Object o)
+  {
+    List<String> out = new ArrayList<>();
+    Iterable<?> iter = o instanceof Object[] ? Arrays.asList((Object[]) o) : o instanceof Iterable ? (Iterable<?>) o : null;
+    if (iter != null) for (Object x : iter) if (x != null && !String.valueOf(x).trim().isEmpty()) out.add(x instanceof Map ? String.valueOf(((Map<?, ?>) x).get("content")) : String.valueOf(x).trim());
+    return out;
   }
 }
