@@ -122,6 +122,9 @@ public class AetherWebSocket
           System.out.println("AetherWebSocket: Routing chat request. Agent=" + agentId + ", Model=" + modelId + ", ContextFiles=" + (contextFiles != null ? contextFiles.size() : 0));
           // A chat message starts a run, or steers the run already working on this chat
           ing.aether.tools.ai.run.RunManager.handleChat(httpSession, (String) session.getUserProperties().get(CLIENT_ID), data, contextFiles);
+        } else if ("characters_sync".equals(type))
+        {
+          ing.aether.tools.ai.CharacterWorker.sync(httpSession, Boolean.TRUE.equals(data.get("force")));
         } else if ("clear_chat".equals(type))
         {
           sessionBuffers.remove(httpSession.getId());

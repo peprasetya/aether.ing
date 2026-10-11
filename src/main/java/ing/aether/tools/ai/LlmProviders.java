@@ -32,6 +32,8 @@ public class LlmProviders
   // Model-list cache: page loads must not pay N live HTTP fetches per request
   private static volatile List<String> cachedModels=null;
   private static volatile long cacheExpires=0;
+  // What the provider itself says about a model (hemera: kind, endpoint, parameters), by qualified id
+  private static volatile Map<String, Map<String, Object>> cachedInfo=new HashMap<>();
 
   // Everything an HTTP request build site needs, resolved from a qualified model id
   public static class Target
@@ -120,18 +122,37 @@ public class LlmProviders
     return qualify("gemma4:e4b-it-bf16");
   }
 
-  // /v1/models carries no capability flag, so the kind is read from the model name. Image models
-  // can only draw and embedding models can only embed: neither may appear in a chat selector
+  // hemera states each model's kind in /v1/models; for every other provider the list carries no
+  // capability flag and the kind is read from the model name. Image, video and 3D models can only
+  // produce their medium and embedding models can only embed: none may appear in a chat selector
   private static final Pattern IMAGE_MODEL=Pattern.compile("image|flux|sdxl|sd3|sd-?\\d|stable-?diffusion|hidream|kolors|dall-?e",Pattern.CASE_INSENSITIVE);
   private static final Pattern EMBEDDING_MODEL=Pattern.compile("embed",Pattern.CASE_INSENSITIVE);
 
   public static final String KindText="text";
   public static final String KindImage="image";
   public static final String KindEmbedding="embedding";
+  public static final String KindVideo="video";
+  public static final String Kind3d="3d";
+
+  // The provider's own description of a model, or null: {kind, endpoint, title, description, parameters}
+  public static Map<String, Object> modelInfo(String qualifiedModel)
+  {
+    if (qualifiedModel==null) return null;
+    if (cachedModels==null || System.currentTimeMillis()>cacheExpires) listModels((Object[])null);
+    return cachedInfo.get(qualifiedModel);
+  }
 
   public static String modelKind(String qualifiedModel)
   {
     if (qualifiedModel==null) return KindText;
+    // Right after a restart nothing has listed the models yet, and a video model's name alone reads as text
+    if (cachedModels==null) listModels((Object[])null);
+    Map<String, Object> info=cachedInfo.get(qualifiedModel);
+    if (info!=null && info.get("kind") instanceof String)
+    {
+      String kind=(String)info.get("kind");
+      if (KindText.equals(kind) || KindImage.equals(kind) || KindVideo.equals(kind) || Kind3d.equals(kind) || KindEmbedding.equals(kind)) return kind;
+    }
     int idx=qualifiedModel.indexOf(SEPARATOR);
     String bare=idx>0?qualifiedModel.substring(idx+SEPARATOR.length()):qualifiedModel;
     if (EMBEDDING_MODEL.matcher(bare).find()) return KindEmbedding;
@@ -160,7 +181,9 @@ public class LlmProviders
     List<String> all=cachedModels;
     if (all==null || System.currentTimeMillis()>cacheExpires)
     {
-      all=fetchAllModels();
+      Map<String, Map<String, Object>> info=new HashMap<>();
+      all=fetchAllModels(info);
+      cachedInfo=info;
       cachedModels=all;
       cacheExpires=System.currentTimeMillis()+CACHE_TTL_MS;
     }
@@ -189,7 +212,7 @@ public class LlmProviders
   }
 
   @SuppressWarnings("unchecked")
-  private static List<String> fetchAllModels()
+  private static List<String> fetchAllModels(Map<String, Map<String, Object>> info)
   {
     List<String> result=new ArrayList<>();
     for (Map<String, Object> provider:getProviders())
@@ -213,6 +236,8 @@ public class LlmProviders
           {
             Object id=((Map<String, Object>)o).get("id");
             if (id!=null) models.add(id.toString());
+            Object hemera=((Map<String, Object>)o).get("hemera");
+            if (id!=null && hemera instanceof Map) info.put(name+SEPARATOR+id, (Map<String, Object>)hemera);
           }
           Collections.sort(models);
           for (String m:models) result.add(name+SEPARATOR+m);

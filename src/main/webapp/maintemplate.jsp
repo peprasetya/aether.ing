@@ -14,6 +14,8 @@
 <link rel="stylesheet" href="/maintemplate.css?<%=cssFile.lastModified()%>">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/codemirror.min.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/addon/hint/show-hint.min.css">
+<%-- three.js for the 3D viewer: only fetched when a .glb is first opened (see ensureModelViewer) --%>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}</script>
 <script src="/scriptlib.js?<%=jsFile.lastModified()%>"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/codemirror.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/addon/hint/show-hint.min.js"></script>
@@ -142,6 +144,39 @@
         <div id="layer-panel" class="layer-panel"></div>
       </div>
     </div>
+    <div id="video-container" class="hidden">
+      <div class="image-toolbar">
+        <button class="p-btn" onclick="saveVideoFrame()" title="Save the frame on screen as a PNG beside the video: edit it, or use it as the first frame of the next clip">Save frame ⇩</button>
+        <label class="media-check"><input type="checkbox" onchange="toggleVideoLoop(this.checked)"> Loop</label>
+        <span id="video-info" class="image-info"></span>
+      </div>
+      <div class="media-stage"><video id="video-player" controls playsinline preload="metadata"></video></div>
+    </div>
+    <div id="model-container" class="hidden">
+      <div class="image-toolbar">
+        <select id="model-view-mode" class="model-view-mode" onchange="setModelViewMode(this.value)" title="What the surface shows">
+          <option value="pbr">PBR (lit)</option>
+          <option value="base">Base colour</option>
+          <option value="vertex">Vertex colour</option>
+          <option value="normalmap">Normal map</option>
+          <option value="roughness">Roughness</option>
+          <option value="metallic">Metallic</option>
+          <option value="ao">Occlusion</option>
+          <option value="uvchecker">UV checker</option>
+          <option value="clay">Shape only (clay)</option>
+          <option value="normals">Surface normals</option>
+        </select>
+        <label class="media-check"><input type="checkbox" id="model-wireframe" onchange="toggleModelWireframe()"> Wireframe</label>
+        <label class="media-check"><input type="checkbox" id="model-uv-toggle" onchange="toggleModelUv(this.checked)"> UV layout</label>
+        <button class="p-btn" onclick="resetModelCamera()" title="Frame the whole model">Fit</button>
+        <button class="p-btn" onclick="saveModelSnapshot()" title="Save this view as a PNG beside the model">Snapshot ⇩</button>
+        <span id="model-info" class="image-info"></span>
+      </div>
+      <div class="image-body">
+        <div id="model-stage" class="model-stage"></div>
+        <div id="model-uv" class="model-uv hidden"><canvas id="model-uv-canvas"></canvas><div id="model-uv-note" class="model-uv-note"></div></div>
+      </div>
+    </div>
     <textarea id="file-content-buffer" style="display:none"></textarea>
   </div>
 
@@ -225,12 +260,21 @@
           </select>
           <label title="Attach the canvas to chat messages; needs a vision-capable text model"><input type="checkbox" id="image-vision" checked> AI sees image</label>
         </div>
+        <%-- Filled by renderMediaParams from the selected model's own parameter list --%>
+        <div id="video-ai-controls" class="image-ai-controls hidden"></div>
+        <div id="model3d-ai-controls" class="image-ai-controls hidden"></div>
         <%-- Outside #ai-selectors as well: menu.jsp regenerates that block --%>
         <div id="task-options" class="task-options hidden">
           <label title="The AI proposes a Definition of Done and a todo list; it starts working after you approve"><input type="checkbox" id="task-plan-gate" checked> Approve plan first</label>
           <select id="task-reviewer-select" class="model-select" title="Model that reviews the work before the task may finish"></select>
         </div>
         <div id="ai-status" class="ai-status hidden"></div>
+        <div id="mention-popup" class="mention-popup hidden"></div>
+        <div id="image-order-strip" class="image-order-strip hidden" title="Pictures the image agent receives, in this order. Refer to them as image 1, image 2 in your prompt"></div>
+        <div id="character-bar" class="character-bar hidden">
+          <select id="character-select" class="model-select" title="Character the next passage focuses on" onchange="onCharacterChange()"><option value="">Narrator</option></select>
+          <button type="button" id="character-resync" class="character-resync" onclick="syncCharacters(true)" title="Re-read the characters from AGENTS.md">↻</button>
+        </div>
         <div class="prompt-btns" id="agent-commands">
           <!-- Agent specific buttons will be populated here -->
         </div>

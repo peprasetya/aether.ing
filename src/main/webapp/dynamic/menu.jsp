@@ -34,6 +34,23 @@
       <option value="<%= model %>"><%= label %></option>
     <% } %>
   </select>
+  <%-- Video and 3D models, shown by onAgentChange for agents that declare "video" / "model3d" --%>
+  <select id="video-model-select" class="model-select hidden" title="Video model" onchange="renderMediaParams('video')">
+    <% for (String model : ing.aether.tools.ai.LlmProviders.filterKind(bean.getModels(), ing.aether.tools.ai.LlmProviders.KindVideo)) {
+      int sepIdx = model.indexOf("::");
+      String label = sepIdx > 0 ? "🎬 [" + model.substring(0, sepIdx) + "] " + model.substring(sepIdx + 2) : "🎬 " + model;
+    %>
+      <option value="<%= model %>"><%= label %></option>
+    <% } %>
+  </select>
+  <select id="model3d-model-select" class="model-select hidden" title="3D model" onchange="renderMediaParams('model3d')">
+    <% for (String model : ing.aether.tools.ai.LlmProviders.filterKind(bean.getModels(), ing.aether.tools.ai.LlmProviders.Kind3d)) {
+      int sepIdx = model.indexOf("::");
+      String label = sepIdx > 0 ? "🧊 [" + model.substring(0, sepIdx) + "] " + model.substring(sepIdx + 2) : "🧊 " + model;
+    %>
+      <option value="<%= model %>"><%= label %></option>
+    <% } %>
+  </select>
   <select id="thinking-mode" class="thinking-select">
      <option value="off">Off</option>
      <option value="low">Low</option>
@@ -141,6 +158,16 @@ document.body.classList.remove('show-footer');
   if (ep != null) {
     epJson = new JSON().toJSON(ep);
   }
+  // What each video / 3D model says about itself (title, parameters): the chat pane builds its settings form from it
+  Map<String, Object> mediaInfo = new java.util.HashMap<>();
+  for (String m : bean.getModels())
+  {
+    String kind = ing.aether.tools.ai.LlmProviders.modelKind(m);
+    if (!ing.aether.tools.ai.LlmProviders.KindVideo.equals(kind) && !ing.aether.tools.ai.LlmProviders.Kind3d.equals(kind)) continue;
+    Map<String, Object> info = ing.aether.tools.ai.LlmProviders.modelInfo(m);
+    if (info != null) mediaInfo.put(m, info);
+  }
+  String mediaInfoJson = new JSON().toJSON(mediaInfo).replace("</", "<\\/");
   Map<String, String> aiCfg = bean.getAiConfig();
   String aiCfgJson = "{}";
   if (aiCfg != null) {
@@ -152,6 +179,7 @@ document.body.classList.remove('show-footer');
   if ("<%=lf != null ? lf : ""%>") window.openedFile = "<%=lf != null ? lf : ""%>";
   window.expandParents = <%=epJson%>;
   window.aiConfig = <%=aiCfgJson%>;
+  window.mediaModelInfo = <%=mediaInfoJson%>;
   if (typeof updateActionButtons === 'function') updateActionButtons();
   if (typeof restoreAIConfig === 'function') restoreAIConfig();
   if (typeof renderChatHistory === 'function') renderChatHistory();

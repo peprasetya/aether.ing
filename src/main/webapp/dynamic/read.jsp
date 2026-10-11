@@ -6,6 +6,14 @@
   <script id="loadScript">
     openImageViewer();
   </script>
+<% } else if ("video".equals(bean.getMedia())) { %>
+  <script id="loadScript">
+    openVideoViewer();
+  </script>
+<% } else if ("3d".equals(bean.getMedia())) { %>
+  <script id="loadScript">
+    openModelViewer();
+  </script>
 <% } else { %>
   <script id="loadScript">
     updateEditorFromBuffer();

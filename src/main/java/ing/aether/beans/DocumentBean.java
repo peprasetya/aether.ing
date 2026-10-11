@@ -15,6 +15,7 @@ public class DocumentBean extends BeanObject
 {
   private String fileContent = "";
   private boolean image = false;
+  private String media = null;
 
   public String getFileContent()
   {
@@ -25,6 +26,12 @@ public class DocumentBean extends BeanObject
   public boolean isImage()
   {
     return image;
+  }
+
+  // "video" or "3d" when the opened file plays in a viewer instead of the text editor, else null
+  public String getMedia()
+  {
+    return media;
   }
 
   public String getFileName()
@@ -89,6 +96,15 @@ public class DocumentBean extends BeanObject
           {
             fileContent = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
           }
+          if (isAjaxCall()) contentType = "text/plain; charset=utf-8";
+          return;
+        }
+
+        // Videos and 3D models open in their viewer, which streams the bytes itself (see MediaBean):
+        // nothing is read here and the text save buffer is left alone, as for images
+        if (ing.aether.tools.ai.MediaWorker.isMediaPath(subPath))
+        {
+          media = ing.aether.tools.ai.MediaWorker.isVideoPath(subPath) ? "video" : "3d";
           if (isAjaxCall()) contentType = "text/plain; charset=utf-8";
           return;
         }

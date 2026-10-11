@@ -75,9 +75,13 @@ public class AgentWorker
   // path ends the turn; the model never sees these entries (streamOllama skips them)
   private static final Map<String, Map<String, Object>> pendingCommands = new ConcurrentHashMap<>();
   private static final int MAX_COMMAND_ENTRIES = 3;
+  private static final int MAX_VISION_IMAGES = 6;
 
   // Flattened canvas attached to this turn's user message for vision-capable models (image agents)
-  private static final Map<String, String> turnImages = new ConcurrentHashMap<>();
+  // Pictures shown to the chat model this turn: {label, data URL}, in the order of ImageWorker.inputImages
+  private static final Map<String, List<String[]>> turnImages = new ConcurrentHashMap<>();
+  // Per turn: {generated tokens, generation nanos, first-token ms, start nanos}, summed over tool rounds
+  private static final Map<String, long[]> turnStats = new ConcurrentHashMap<>();
 
   public static boolean handlePermission(String httpSessionId, boolean granted)
   {
@@ -164,6 +168,7 @@ public class AgentWorker
     }
     // An image run holds the GPU for minutes: tell the image server to stop, not just our thread
     ImageWorker.cancel(httpSessionId);
+    MediaWorker.cancel(httpSessionId);
     // Close the response stream: a thread blocked in readLine() does not react to interrupt
     InputStream s = activeAiStreams.remove(httpSessionId);
     if (s != null) try { s.close(); } catch (Exception ignore) {}
@@ -180,7 +185,7 @@ public class AgentWorker
 
   // Atomic read-modify-write: reads file once, applies fn, writes once
   @SuppressWarnings("unchecked")
-  private static void atomicConfigWrite(HttpSession session, String configPath, java.util.function.BiConsumer<HttpSession, Map<String, Object>> fn) throws Exception
+  static void atomicConfigWrite(HttpSession session, String configPath, java.util.function.BiConsumer<HttpSession, Map<String, Object>> fn) throws Exception
   {
     Long lastFail = configWriteFailures.get(configPath);
     if (lastFail != null && System.currentTimeMillis() - lastFail < 60000L) throw new Exception("Skipping save of " + configPath + ": previous write failed less than a minute ago");
@@ -276,6 +281,9 @@ public class AgentWorker
         agent.setName((String) map.get("name"));
         agent.setPrompt((String) map.get("prompt"));
         agent.setImage(Boolean.TRUE.equals(map.get("image")));
+        agent.setPersonality(!Boolean.FALSE.equals(map.get("personality")));
+        agent.setVideo(Boolean.TRUE.equals(map.get("video")));
+        agent.setModel3d(Boolean.TRUE.equals(map.get("model3d")));
         agent.setBehavior((String) map.get("behavior"));
         if (map.get("reviewer") instanceof Map) agent.setReviewerModel((String) ((Map<String, Object>) map.get("reviewer")).get("model"));
         if (map.get("budget") instanceof Map) agent.setBudget((Map<String, Object>) map.get("budget"));
@@ -390,16 +398,29 @@ public class AgentWorker
       }
     }
 
+    // Ticked files of this turn: image commands and image tools read them as input pictures
+    session.setAttribute("turnContextFiles", contextFiles == null ? new ArrayList<String>() : new ArrayList<String>(contextFiles));
+    turnStats.remove(session.getId());
+
     // Direct image commands never involve the chat model: the prompt goes straight to the image model
     if (cmd != null && "image".equals(cmd.getResponse()))
     {
       runImageCommand(session, realAgentId, cmd, userMessage);
       return;
     }
+    // Direct video / 3D commands: one job on that kind's model, the chat model is not involved either
+    if (cmd != null && (MediaWorker.VIDEO.equals(cmd.getResponse()) || MediaWorker.MODEL3D.equals(cmd.getResponse())))
+    {
+      runMediaCommand(session, realAgentId, cmd, userMessage);
+      return;
+    }
 
     // Prepare context
     sendStatus(session.getId(), "preparing", describePreparation(session, contextFiles));
     Map<String, String> contextMap = buildContextMap(session, contextFiles, selectedText);
+    // Command templates carry [[CHARACTER]]; the narrator (nothing selected) expands to nothing
+    Object selectedCharacter = session.getAttribute("turnCharacter");
+    contextMap.put("CHARACTER", selectedCharacter instanceof String ? CharacterWorker.directive((String) selectedCharacter) : "");
     contextMap.put("USER_INPUT", (userMessage == null || userMessage.isEmpty()) ? "(User does not give input, you can decide by your own)" : userMessage);
     // Build rich System Prompt
     StringBuilder sbSystem = new StringBuilder();
@@ -481,9 +502,11 @@ public class AgentWorker
 
     // The image tools default to what the user set in the chat pane; the model sees it so it can reason about cost
     if (agent.isImage()) sbContext.append("\n\n").append(describeImageSettings(session));
+    if (agent.isVideo()) sbContext.append("\n\n").append(describeMediaSettings(session, MediaWorker.VIDEO));
+    if (agent.isModel3d()) sbContext.append("\n\n").append(describeMediaSettings(session, MediaWorker.MODEL3D));
 
     // Rewritten by the psychologist on almost every turn, so it sits last, behind the open file
-    String personality = contextMap.get("USER_PERSONALITY");
+    String personality = agent.isPersonality() ? contextMap.get("USER_PERSONALITY") : null;
     if (personality != null && !personality.isEmpty()) sbContext.append("\n\nUser Personality Profile (background only — adapt your tone to match it; never quote, summarise or discuss this profile):\n").append(personality);
 
     // Unlabelled, this turn reads like something the user typed and the model answers it instead
@@ -534,12 +557,24 @@ public class AgentWorker
     turnImages.remove(session.getId());
     if (agent.isImage() && !"false".equals(String.valueOf(imageParams(session).get("vision"))))
     {
-      String openFile = (String) session.getAttribute("lastFilePath");
-      if (ImageWorker.isImagePath(openFile))
+      // Every ticked image plus the open canvas, numbered: "Image 2" means the same here, in the prompt and in editImage
+      List<String[]> pics = new ArrayList<>();
+      int n = 1;
+      for (String p : ImageWorker.inputImages(session))
       {
-        String dataUrl = ImageWorker.canvasDataUrl(session, openFile);
-        if (dataUrl != null) turnImages.put(session.getId(), dataUrl);
+        String dataUrl = n <= MAX_VISION_IMAGES ? ImageWorker.inputDataUrl(session, p) : null;
+        if (dataUrl != null) pics.add(new String[] { "Image " + n + ": " + AITools.resolveRelativePath(session, p) + (p.equals(session.getAttribute("lastFilePath")) ? " (the open image, all visible layers flattened)" : ""), dataUrl });
+        n++;
       }
+      if (!pics.isEmpty()) turnImages.put(session.getId(), pics);
+      String shown = pics.isEmpty() ? "No picture is attached for the chat model (nothing ticked or open, or none could be read)" : "Showing the chat model " + pics.size() + (pics.size() == 1 ? " picture" : " pictures");
+      System.out.println("Vision: " + shown + " [inputs=" + ImageWorker.inputImages(session).size() + "]");
+      sendStatus(session.getId(), "preparing", shown + "…");
+    }
+    else if (agent.isImage())
+    {
+      System.out.println("Vision: off (AI sees image = " + imageParams(session).get("vision") + ")");
+      sendStatus(session.getId(), "preparing", "Pictures not attached: \"AI sees image\" is off");
     }
 
     // Persist AI config transparently (non-blocking, Google Drive API may be slow)
@@ -574,7 +609,7 @@ public class AgentWorker
 
     // Non-chatlog commands get an ephemeral turn list so their tool rounds neither read nor pollute the chat session
     streamOllama(session, model, thinkingMode, sbSystem.toString(), sbContext.toString(), finalUserPrompt, useHistory ? history : new ArrayList<>(), responseType, responseTarget, effectiveTools, useHistory);
-    runPsychologist(session, userMessage);
+    if (agent.isPersonality()) runPsychologist(session, userMessage);
 
   }
 
@@ -614,6 +649,131 @@ public class AgentWorker
       + ", edit source " + p.getOrDefault("source", "canvas") + ".";
   }
 
+  // Session attribute names of the model and the pane settings of a media kind
+  private static String mediaModelAttr(String kind)
+  {
+    return MediaWorker.VIDEO.equals(kind) ? "videoModel" : "model3dModel";
+  }
+
+  @SuppressWarnings("unchecked")
+  private static Map<String, Object> mediaParams(HttpSession session, String kind)
+  {
+    Object p = session.getAttribute(MediaWorker.VIDEO.equals(kind) ? "videoParams" : "model3dParams");
+    return p instanceof Map ? (Map<String, Object>) p : new HashMap<>();
+  }
+
+  // The selected video / 3D model, what the user set in the pane and which fields the model accepts,
+  // so the chat model can fill generateVideo / generate3d correctly and reason about cost
+  @SuppressWarnings("unchecked")
+  private static String describeMediaSettings(HttpSession session, String kind)
+  {
+    boolean video = MediaWorker.VIDEO.equals(kind);
+    String model = (String) session.getAttribute(mediaModelAttr(kind));
+    StringBuilder sb = new StringBuilder();
+    sb.append(video ? "Video settings (defaults for generateVideo): video model " : "3D settings (defaults for generate3d): 3D model ").append(model != null ? model : "none selected");
+    Map<String, Object> info = LlmProviders.modelInfo(model);
+    if (info != null && info.get("title") != null) sb.append(" (").append(info.get("title")).append(")");
+    if (info != null && info.get("description") != null) sb.append(". ").append(info.get("description"));
+    Map<String, Object> chosen = mediaParams(session, kind);
+    if (!chosen.isEmpty()) sb.append("\nSet by the user: ").append(json.toJSON(chosen));
+    Map<String, Object> accepted = MediaWorker.parametersOf(model);
+    if (accepted != null)
+    {
+      sb.append("\nParameters this model accepts:");
+      for (Map.Entry<String, Object> e : accepted.entrySet())
+      {
+        if (!(e.getValue() instanceof Map)) continue;
+        Map<String, Object> spec = (Map<String, Object>) e.getValue();
+        sb.append("\n- ").append(e.getKey()).append(" (").append(spec.get("type"));
+        if (spec.get("values") instanceof Object[]) sb.append(": ").append(Arrays.toString((Object[]) spec.get("values")));
+        if (spec.get("min") != null || spec.get("max") != null) sb.append(", ").append(spec.get("min")).append("–").append(spec.get("max"));
+        if (spec.get("default") != null) sb.append(", default ").append(spec.get("default"));
+        if (Boolean.TRUE.equals(spec.get("required"))) sb.append(", required");
+        sb.append(")");
+        if (spec.get("description") != null) sb.append(": ").append(spec.get("description"));
+      }
+    }
+    return sb.toString();
+  }
+
+  // A direct media command (agent command with "response": "video" or "3d"), with the same working-state,
+  // status, stop and command-trail behaviour as a chat turn
+  private static void runMediaCommand(HttpSession session, String agentId, AgentCommand cmd, String userMessage)
+  {
+    final String httpSessionId = session.getId();
+    final String kind = cmd.getResponse();
+    final String mediaModel = (String) session.getAttribute(mediaModelAttr(kind));
+    Map<String, Object> params = new HashMap<>(mediaParams(session, kind));
+    Map<String, String> ctx = new HashMap<>();
+    ctx.put("USER_INPUT", userMessage == null ? "" : ImageWorker.resolveMentions(session, userMessage));
+    String expanded = expandPrompt(cmd.getPrompt(), ctx).trim();
+    if (MediaWorker.VIDEO.equals(kind)) params.put("prompt", expanded);
+    else if (!expanded.isEmpty()) params.put("name", expanded);
+
+    Map<String, Object> entry = new HashMap<>();
+    entry.put("role", "command");
+    entry.put("time", System.currentTimeMillis());
+    entry.put("label", cmd.getLabel());
+    entry.put("commandId", cmd.getId());
+    entry.put("agent", agentId);
+    entry.put("input", userMessage == null ? "" : userMessage);
+    entry.put("responseType", kind);
+    entry.put("model", mediaModel);
+    pendingCommands.put(httpSessionId, entry);
+
+    CompletableFuture.runAsync(() ->
+    {
+      activeAiThreads.put(httpSessionId, Thread.currentThread());
+      long start = System.nanoTime();
+      try
+      {
+        Map<String, Object> result = MediaWorker.run(session, httpSessionId, kind, mediaModel, params);
+        finishCommand(session, httpSessionId, String.valueOf(result.get("path")), null);
+        Map<String, Object> done = new HashMap<>();
+        done.put("type", "chat_done");
+        done.put("responseType", kind);
+        done.put("total_duration", System.nanoTime() - start);
+        if (AetherWebSocket.sendToSession(httpSessionId, done)) AetherWebSocket.clearBuffer(httpSessionId);
+      }
+      catch (Exception e)
+      {
+        boolean stopped = Thread.currentThread().isInterrupted() || e instanceof InterruptedException;
+        if (stopped) pendingCommands.remove(httpSessionId);
+        else
+        {
+          finishCommand(session, httpSessionId, null, e.getMessage());
+          AetherWebSocket.sendToSession(httpSessionId, Map.of("type", "chat_error", "error", (MediaWorker.VIDEO.equals(kind) ? "Video: " : "3D: ") + e.getMessage()));
+        }
+      }
+      finally
+      {
+        activeAiThreads.remove(httpSessionId, Thread.currentThread());
+      }
+    }, RunManager.AI_EXECUTOR);
+  }
+
+  // Tool entry point for generateVideo / generate3d: the model's arguments override the user's pane settings
+  @SuppressWarnings("unchecked")
+  private static String runMediaTool(HttpSession session, String httpSessionId, String name, Map<String, Object> args) throws Exception
+  {
+    String kind = "generateVideo".equals(name) ? MediaWorker.VIDEO : MediaWorker.MODEL3D;
+    Map<String, Object> params = new HashMap<>(mediaParams(session, kind));
+    // The pane's first/last frame choice belongs to the buttons; the chat model names its pictures itself
+    params.remove("image");
+    params.remove("end_image");
+    if (args.get("options") instanceof Map) params.putAll((Map<String, Object>) args.get("options"));
+    for (Map.Entry<String, Object> e : args.entrySet()) if (e.getValue() != null && !"options".equals(e.getKey()) && !"explain".equals(e.getKey())) params.put(e.getKey(), e.getValue());
+    Map<String, Object> r = MediaWorker.run(session, httpSessionId, kind, (String) session.getAttribute(mediaModelAttr(kind)), params);
+    String rel = AITools.resolveRelativePath(session, String.valueOf(r.get("path")));
+    StringBuilder sb = new StringBuilder();
+    sb.append(MediaWorker.VIDEO.equals(kind) ? "Video generated in " : "3D model built in ").append(ImageWorker.formatDuration(((Number) r.get("seconds")).longValue()));
+    sb.append(" and saved as ").append(rel).append(" (").append(((Number) r.get("bytes")).longValue() / (1024 * 1024)).append(" MB)");
+    if (r.get("seed") != null) sb.append(", seed ").append(r.get("seed"));
+    if (r.get("parameters") != null) sb.append(", parameters used ").append(json.toJSON(r.get("parameters")));
+    sb.append(". It is open in the viewer for the user; you cannot see it yourself.");
+    return sb.toString();
+  }
+
   // A direct image command (agent command with "response": "image"): one run on the image model,
   // with the same working-state, status, stop and command-trail behaviour as a chat turn
   private static void runImageCommand(HttpSession session, String agentId, AgentCommand cmd, String userMessage)
@@ -623,7 +783,7 @@ public class AgentWorker
     Map<String, Object> params = new HashMap<>(imageParams(session));
     params.put("mode", "edit".equals(cmd.getMode()) ? "edit" : "generate");
     Map<String, String> ctx = new HashMap<>();
-    ctx.put("USER_INPUT", userMessage == null ? "" : userMessage);
+    ctx.put("USER_INPUT", userMessage == null ? "" : ImageWorker.resolveMentions(session, userMessage));
     params.put("prompt", expandPrompt(cmd.getPrompt(), ctx));
 
     Map<String, Object> entry = new HashMap<>();
@@ -734,6 +894,8 @@ public class AgentWorker
         if (agentId != null) config.put("agent_id", agentId);
         Object imageModel = session.getAttribute("imageModel");
         if (imageModel != null) config.put("image_model", imageModel);
+        if (session.getAttribute("videoModel") != null) config.put("video_model", session.getAttribute("videoModel"));
+        if (session.getAttribute("model3dModel") != null) config.put("model3d_model", session.getAttribute("model3dModel"));
       });
     } catch (Exception e) { e.printStackTrace(); }
   }
@@ -753,6 +915,8 @@ public class AgentWorker
       Object agentId = config.get("agent_id");
       Object imageModel = config.get("image_model");
       if (imageModel != null) result.put("image_model", imageModel.toString());
+      if (config.get("video_model") != null) result.put("video_model", config.get("video_model").toString());
+      if (config.get("model3d_model") != null) result.put("model3d_model", config.get("model3d_model").toString());
       // Configs saved before multi-provider support hold bare model ids; qualify them so
       // they keep matching the dropdown options, which are always "Provider::model"
       if (model != null) result.put("model", LlmProviders.qualify(model.toString()));
@@ -1136,7 +1300,7 @@ public class AgentWorker
   }
 
   @SuppressWarnings("unchecked")
-  private static void internalQuery(String httpSessionId, String task, List<Map<String, String>> messages, java.util.function.Consumer<String> onResult)
+  static void internalQuery(String httpSessionId, String task, List<Map<String, String>> messages, java.util.function.Consumer<String> onResult)
   {
     LlmProviders.Target target = LlmProviders.resolve(LlmProviders.internalModel());
     if (target == null)
@@ -1277,8 +1441,13 @@ public class AgentWorker
       try
       {
         List<String> allFiles = AITools.listAllFiles(session, workingDir);
+        // Sorted: the provider lists files in an order that shifts whenever one is saved, and a reordered list
+        // changes the prompt just ahead of the question, which defeats the model server's prefix cache
+        List<String> relative = new ArrayList<>();
+        for (String f : allFiles) relative.add(AITools.resolveRelativePath(session, f));
+        Collections.sort(relative);
         StringBuilder sb = new StringBuilder();
-        for (String f : allFiles) sb.append("- ").append(AITools.resolveRelativePath(session, f)).append("\n");
+        for (String f : relative) sb.append("- ").append(f).append("\n");
         context.put("PROJECT_STRUCTURE", sb.toString());
       } catch (Exception e) {}
     }
@@ -1289,6 +1458,13 @@ public class AgentWorker
     {
       String rel = AITools.resolveRelativePath(session, activeFile);
       context.put("CONTENT", ImageWorker.describe(session, activeFile, rel));
+      context.put("RELATIVE_PATH", rel);
+    }
+    // Same for a video or a 3D model: tens of megabytes of binary must never be read into the prompt
+    else if (activeFile != null && MediaWorker.isMediaPath(activeFile))
+    {
+      String rel = AITools.resolveRelativePath(session, activeFile);
+      context.put("CONTENT", (MediaWorker.isVideoPath(activeFile) ? "A video" : "A 3D model (GLB)") + " is open in the viewer: " + rel + ". It is a binary file: you cannot read or watch it, only refer to it by name.");
       context.put("RELATIVE_PATH", rel);
     }
     else if (activeFile != null)
@@ -1309,7 +1485,13 @@ public class AgentWorker
        {
          if (ImageWorker.isImagePath(f))
          {
-           sb.append("\n--- FILE: ").append(AITools.resolveRelativePath(session, f)).append(" ---\n[image file: its pixels are not sent as text]\n");
+           int idx = ImageWorker.inputImages(session).indexOf(f) + 1;
+           sb.append("\n--- FILE: ").append(AITools.resolveRelativePath(session, f)).append(" ---\n[image file, Image ").append(idx).append(": attached to this message as a picture when the agent can see images]\n");
+           continue;
+         }
+         if (MediaWorker.isMediaPath(f))
+         {
+           sb.append("\n--- FILE: ").append(AITools.resolveRelativePath(session, f)).append(" ---\n[").append(MediaWorker.isVideoPath(f) ? "video" : "3D model").append(" file: binary, not sent as text]\n");
            continue;
          }
          try {
@@ -1441,11 +1623,18 @@ public class AgentWorker
           messages.add(userMsg);
         }
         // Image agents: the flattened canvas rides on the prompt message, the tail of the request, so the cached prefix is untouched
-        String turnImage = turnImages.get(httpSessionId);
-        if (turnImage != null)
+        List<String[]> turnPics = turnImages.get(httpSessionId);
+        if (turnPics != null)
         {
           int promptIdx = lastUserIdx >= 0 ? lastUserIdx : messages.size() - 1;
-          messages.get(promptIdx).put("content", Arrays.asList(Map.of("type", "text", "text", userPrompt), Map.of("type", "image_url", "image_url", Map.of("url", turnImage))));
+          List<Object> parts = new ArrayList<>();
+          parts.add(Map.of("type", "text", "text", userPrompt));
+          for (String[] pic : turnPics)
+          {
+            parts.add(Map.of("type", "text", "text", pic[0]));
+            parts.add(Map.of("type", "image_url", "image_url", Map.of("url", pic[1])));
+          }
+          messages.get(promptIdx).put("content", parts);
         }
         request.put("messages", messages);
 
@@ -1682,6 +1871,11 @@ public class AgentWorker
             aiMsg.put("time", System.currentTimeMillis());
             history.add(aiMsg);
             if (includeHistory) saveChatSession(session, history);
+            // Tool rounds are part of the same turn: keep their tokens and time in the final statistics
+            long[] roundStats = turnStats.get(httpSessionId);
+            if (roundStats == null) { roundStats = new long[] { 0, 0, ttftMs, sentNanos }; turnStats.put(httpSessionId, roundStats); }
+            roundStats[0] += completionTokens > 0 ? completionTokens : (fullResponse.length() + thinking.length()) / 4;
+            roundStats[1] += firstTokenNanos > 0 ? System.nanoTime() - firstTokenNanos : 0;
             executeToolsAndRepeat(session, httpSessionId, history, toolCalls, model, thinkingMode, systemPrompt, contextBlock, userPrompt, responseType, responseTarget, toolNames, includeHistory);
             return;
           }
@@ -1695,11 +1889,21 @@ public class AgentWorker
 
               // Performance metrics: token counts from usage; generation time is wall-clock (first token -> end).
               // The OpenAI-compatible /v1/chat/completions stream reports no prefill/prompt-eval duration, so it is omitted.
-              done.put("total_duration", endNanos - sentNanos);
-              done.put("ttft_ms", ttftMs);
+              // A provider that omits usage still gets figures: ~4 chars per token, flagged approximate
+              boolean approx = completionTokens == 0 && (fullResponse.length() + thinking.length()) > 0;
+              if (approx) completionTokens = Math.max(1, (fullResponse.length() + thinking.length()) / 4);
+              if (promptTokens == 0) { promptTokens = promptChars / 4; approx = true; }
+              long[] ts = turnStats.get(httpSessionId);
+              if (ts == null) ts = new long[] { 0, 0, ttftMs, sentNanos };
+              ts[0] += completionTokens;
+              ts[1] += firstTokenNanos > 0 ? endNanos - firstTokenNanos : 0;
+              done.put("total_duration", endNanos - ts[3]);
+              done.put("ttft_ms", ts[2]);
               done.put("prompt_eval_count", promptTokens);
-              done.put("eval_count", completionTokens);
-              done.put("eval_duration", firstTokenNanos > 0 ? endNanos - firstTokenNanos : 0);
+              done.put("eval_count", ts[0]);
+              done.put("eval_duration", ts[1]);
+              if (approx) done.put("stats_approx", true);
+              turnStats.remove(httpSessionId);
 
               if ("chat".equals(responseType) && includeHistory && (fullResponse.length() > 0 || thinking.length() > 0))
               {
@@ -2127,12 +2331,31 @@ public class AgentWorker
           function.put("description", "Change the OPEN image with the image model; the result is saved as a new PNG and added as a new top layer (the original is never overwritten). Same cost as generateImage. source 'canvas' sends the whole composed canvas; 'layers' with a list of layer names sends those layers as separate input images, which is how subjects from different layers are combined into one scene.");
           properties.put("prompt", Map.of("type", "string", "description", "The change to make, described concretely; say what must stay the same."));
           properties.put("source", Map.of("type", "string", "enum", Arrays.asList("canvas", "layers"), "description", "What to send to the image model. Omit to use the user's setting."));
-          properties.put("layers", Map.of("type", "array", "items", Map.of("type", "string"), "description", "Layer names to send as separate input images (with source 'layers')."));
+          properties.put("layers", Map.of("type", "array", "items", Map.of("type", "string"), "description", "Input images to send, in this order: layer names, or ticked files by name or as 'Image 1', 'Image 2'. Omit to send every ticked image (in tick order), or the flattened canvas when none is ticked."));
           properties.put("size", Map.of("type", "string", "description", "WIDTHxHEIGHT in multiples of 32. Omit to use the user's size setting."));
           properties.put("steps", Map.of("type", "number", "description", "Diffusion steps, 4-50. Omit to use the user's setting."));
           properties.put("transparent", Map.of("type", "boolean", "description", "Transparent background for the result."));
           properties.put("name", Map.of("type", "string", "description", "Short file-name hint."));
           required.add("prompt");
+          break;
+        case "generateVideo":
+          function.put("description", "Create a video clip (with sound) with the video model. Very slow on this server: 2 to 10 minutes depending on size and length, so agree on the idea first, keep clips short, and never call it twice for one request. Give 'image' to animate an existing picture (image-to-video): refine that picture with generateImage / editImage first when the look matters, because the video follows it closely. The result is saved as an MP4 and opened in the player.");
+          properties.put("prompt", Map.of("type", "string", "description", "What happens in the clip, in English: subject, action, camera movement, mood, and the sound (dialogue, ambience, music)."));
+          properties.put("image", Map.of("type", "string", "description", "First frame: a ticked or open picture, by file name or as 'Image 1'. Omit for text-to-video."));
+          properties.put("end_image", Map.of("type", "string", "description", "Last frame, same naming. Only for models that list end_image."));
+          properties.put("seconds", Map.of("type", "number", "description", "Clip length in seconds. Omit to use the user's setting."));
+          properties.put("size", Map.of("type", "string", "description", "WIDTHxHEIGHT, e.g. 768x448. Omit to use the user's setting."));
+          properties.put("options", Map.of("type", "object", "description", "Other parameters of the selected video model, exactly as listed in the workspace context (for example steps, seed, negative_prompt)."));
+          properties.put("name", Map.of("type", "string", "description", "Short file-name hint."));
+          required.add("prompt");
+          break;
+        case "generate3d":
+          function.put("description", "Build a 3D mesh (GLB) from ONE picture with the 3D model. Very slow on this server: a few minutes with vertex colours, 20 to 40 minutes with texture 'pbr', so confirm the picture and the settings first and never call it twice for one request. The picture must show one object, whole and uncropped, ideally on a plain or transparent background: prepare it with generateImage / editImage first when it does not. The result is saved as a .glb and opened in the 3D viewer.");
+          properties.put("image", Map.of("type", "string", "description", "The object's picture: a ticked or open picture, by file name or as 'Image 1'. Omit to use Image 1."));
+          properties.put("texture", Map.of("type", "string", "enum", Arrays.asList("vertex", "pbr", "none"), "description", "vertex: colour per vertex, minutes. pbr: UV-unwrapped mesh with base colour, metallic, roughness, normal and occlusion maps, tens of minutes. none: geometry only. Only for models that list it."));
+          properties.put("faces", Map.of("type", "number", "description", "Triangle budget. Omit for the model's default."));
+          properties.put("options", Map.of("type", "object", "description", "Other parameters of the selected 3D model, exactly as listed in the workspace context (for example texture_size, remove_background, steps, resolution, seed)."));
+          properties.put("name", Map.of("type", "string", "description", "Short file-name hint, e.g. 'toy-robot'."));
           break;
         case "delegate":
           function.put("description", "Delegate ONE self-contained chunk of the task to a worker agent with its own fresh context (it cannot see this conversation). It reads, searches and edits files (edits follow the same approval rules) and returns a report of what it did and changed. Give it everything it needs: file paths, requirements, conventions, and what 'done' means for this chunk. Keep small edits yourself.");
@@ -2251,6 +2474,8 @@ public class AgentWorker
         case "subTask": logAction = "🤖 Sub-task: " + args.get("description"); break;
         case "generateImage": logAction = "🎨 Generating image: " + args.get("prompt"); break;
         case "editImage": logAction = "🖌️ Editing image: " + args.get("prompt"); break;
+        case "generateVideo": logAction = "🎬 Generating video: " + args.get("prompt"); break;
+        case "generate3d": logAction = "🧊 Building 3D model" + (args.get("image") != null ? " from " + args.get("image") : ""); break;
         case "renameFile": logAction = "✏️ Renaming: " + pathArg + " → " + args.get("new_name"); break;
         case "moveFile": logAction = "📦 Moving: " + pathArg + " → " + args.get("destination"); break;
         case "copyFile": logAction = "📄 Copying: " + pathArg + " → " + args.get("destination"); break;
@@ -2363,6 +2588,7 @@ public class AgentWorker
           case "proposePlan": result = proposePlan(session, httpSessionId, args); break;
           case "finish": result = StopGates.finish(session, httpSessionId, args); break;
           case "generateImage": case "editImage": result = runImageTool(session, httpSessionId, name, args); break;
+          case "generateVideo": case "generate3d": result = runMediaTool(session, httpSessionId, name, args); break;
         }
       }
       catch (InterruptedException ie) { throw ie; } // user stop: propagate so the whole turn (incl. sub-agents) ends
@@ -2416,7 +2642,7 @@ public class AgentWorker
         if (result != null) {
             if (name.equals("askUser")) {
                 summary = "✅ Answers sent to the AI";
-            } else if (name.equals("todoWrite") || name.equals("generateImage") || name.equals("editImage")) {
+            } else if (name.equals("todoWrite") || name.equals("generateImage") || name.equals("editImage") || name.equals("generateVideo") || name.equals("generate3d")) {
                 summary = "✅ " + result;
             } else if (name.equals("runCommand")) {
                 String firstLine = result.contains("\n") ? result.substring(0, result.indexOf('\n')) : result;

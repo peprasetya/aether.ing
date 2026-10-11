@@ -64,6 +64,13 @@ public class SaveBean extends BeanObject
     String subPath = path.getSuffix();
     if (subPath.isEmpty()) return;
     // Text autosave must never land on an image: those are written only by the image viewer (imagesave)
+    // Nor on a video or a 3D model: writing the editor's text over one would destroy it
+    if (ing.aether.tools.ai.MediaWorker.isMediaPath(subPath))
+    {
+      success = false;
+      message = "Not saved: videos and 3D models are not text files";
+      return;
+    }
     if (ing.aether.tools.ai.ImageWorker.isImagePath(subPath))
     {
       success = false;

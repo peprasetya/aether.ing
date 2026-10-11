@@ -196,6 +196,14 @@ public class RunManager
     Object imageModel = data.get("image_model_id");
     if (imageModel instanceof String && !((String) imageModel).isEmpty()) http.setAttribute("imageModel", imageModel);
     if (data.get("image_params") instanceof Map) http.setAttribute("imageParams", data.get("image_params"));
+    // Video and 3D agents: the model of that kind and the pane's generated settings form
+    if (data.get("video_model_id") instanceof String && !((String) data.get("video_model_id")).isEmpty()) http.setAttribute("videoModel", data.get("video_model_id"));
+    if (data.get("model3d_model_id") instanceof String && !((String) data.get("model3d_model_id")).isEmpty()) http.setAttribute("model3dModel", data.get("model3d_model_id"));
+    if (data.get("video_params") instanceof Map) http.setAttribute("videoParams", data.get("video_params"));
+    if (data.get("model3d_params") instanceof Map) http.setAttribute("model3dParams", data.get("model3d_params"));
+    // The character picked in the chat pane; every message restates it, so an empty value is the narrator
+    if (data.get("character") instanceof String && !((String) data.get("character")).trim().isEmpty()) http.setAttribute("turnCharacter", ((String) data.get("character")).trim());
+    else http.removeAttribute("turnCharacter");
 
     String agentRef = (String) data.get("agent_id");
     String modelId = (String) data.get("model_id");

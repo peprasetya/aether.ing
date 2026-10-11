@@ -253,7 +253,83 @@ public class ImageWorker
     {
       Map<String, Object> doc = sidecarOrDefault(session, imagePath);
       if (doc == null) return null;
-      BufferedImage full = compose(session, imagePath, doc);
+      return previewDataUrl(compose(session, imagePath, doc));
+    } catch (Exception e)
+    {
+      System.out.println("WARN: canvas preview for the chat model failed: " + e.getMessage());
+      return null;
+    }
+  }
+
+  // Images the user ticked in the explorer, in order, plus the open image (first) when it is not ticked.
+  // The open image stands for its flattened canvas. Chat vision, edit inputs and the context text all use this order
+  public static List<String> inputImages(HttpSession session)
+  {
+    List<String> out = new ArrayList<>();
+    String open = (String) session.getAttribute("lastFilePath");
+    Object cf = session.getAttribute("turnContextFiles");
+    if (cf instanceof List) for (Object o : (List<?>) cf)
+    {
+      String p = String.valueOf(o);
+      if (isImagePath(p) && !out.contains(p)) out.add(p);
+    }
+    if (isImagePath(open) && !out.contains(open)) out.add(0, open);
+    return out;
+  }
+
+  // "@portrait.jpg" in a prompt becomes "image N", the number the model is given (see inputImages). Longest names
+  // first so "@a.png" cannot eat the start of "@a.png.bak". An unknown @name is left untouched
+  public static String resolveMentions(HttpSession session, String text)
+  {
+    if (text == null || text.indexOf('@') < 0) return text;
+    List<String> inputs = inputImages(session);
+    List<Integer> order = new ArrayList<>();
+    for (int i = 0; i < inputs.size(); i++) order.add(i);
+    order.sort((a, b) -> nameOf(inputs.get(b)).length() - nameOf(inputs.get(a)).length());
+    for (int i : order) text = text.replace("@" + nameOf(inputs.get(i)), "image " + (i + 1));
+    return text;
+  }
+
+  // One input picture as PNG bytes: the flattened canvas for the open image, the file itself otherwise
+  public static byte[] inputPng(HttpSession session, String path) throws Exception
+  {
+    if (path.equals(session.getAttribute("lastFilePath")))
+    {
+      Map<String, Object> doc = sidecarOrDefault(session, path);
+      if (doc != null) return toPng(compose(session, path, doc));
+    }
+    return toPng(readImage(session, path));
+  }
+
+  // "Image 2", a file name or a full path, resolved against inputImages; a null or empty name is the first input.
+  // Returns null when there is no such picture
+  public static String resolveInput(HttpSession session, String name)
+  {
+    List<String> inputs = inputImages(session);
+    if (name == null || name.trim().isEmpty()) return inputs.isEmpty() ? null : inputs.get(0);
+    String n = name.trim();
+    for (int i = 0; i < inputs.size(); i++) if (n.equals(inputs.get(i)) || n.equals(nameOf(inputs.get(i))) || n.equalsIgnoreCase("image " + (i + 1))) return inputs.get(i);
+    return null;
+  }
+
+  // Downscaled JPEG data URL of one input image: the canvas for the open image, the file otherwise
+  public static String inputDataUrl(HttpSession session, String path)
+  {
+    if (path.equals(session.getAttribute("lastFilePath"))) return canvasDataUrl(session, path);
+    try
+    {
+      return previewDataUrl(readImage(session, path));
+    } catch (Exception e)
+    {
+      System.out.println("WARN: preview of " + nameOf(path) + " for the chat model failed: " + e.getMessage());
+      return null;
+    }
+  }
+
+  private static String previewDataUrl(BufferedImage full)
+  {
+    try
+    {
       double f = Math.min(1.0, (double) VISION_MAX_SIDE / Math.max(full.getWidth(), full.getHeight()));
       int w = Math.max(1, (int) Math.round(full.getWidth() * f));
       int h = Math.max(1, (int) Math.round(full.getHeight() * f));
@@ -270,7 +346,7 @@ public class ImageWorker
       return "data:image/jpeg;base64," + Base64.getEncoder().encodeToString(bos.toByteArray());
     } catch (Exception e)
     {
-      System.out.println("WARN: canvas preview for the chat model failed: " + e.getMessage());
+      System.out.println("WARN: image preview for the chat model failed: " + e.getMessage());
       return null;
     }
   }
@@ -376,10 +452,13 @@ public class ImageWorker
     body.put("size", size[0] + "x" + size[1]);
     body.put("steps", steps);
     if (transparent) body.put("background", "transparent");
+    // Without a seed the engine reuses its default one, so the same prompt gave the same picture every time
+    long seed = params.get("seed") != null ? (long) asDouble(params.get("seed"), 0) : (long) (Math.random() * 2147483647L);
+    body.put("seed", seed);
 
     if ("edit".equals(mode))
     {
-      if (doc == null) throw new Exception("Editing needs an open image. Open one in the viewer, or ask for a new image instead.");
+      if (doc == null && inputImages(session).isEmpty()) throw new Exception("Editing needs an open or ticked image. Open one in the viewer, tick files in the explorer, or ask for a new image instead.");
       List<byte[]> inputs = editInputs(session, imagePath, doc, params);
       List<String> encoded = new ArrayList<>();
       long bytes = 0;
@@ -389,7 +468,10 @@ public class ImageWorker
         bytes += b.length;
       }
       body.put("images", encoded);
-      AgentWorker.sendStatus(httpSessionId, "image", "Sending " + inputs.size() + (inputs.size() == 1 ? " image" : " images") + " (" + (bytes / 1024) + " KB) to " + target.model);
+      List<String> order = new ArrayList<>();
+      int n = 1;
+      for (String p : inputImages(session)) order.add("Image " + n++ + " = " + nameOf(p));
+      AgentWorker.sendStatus(httpSessionId, "image", "Sending " + inputs.size() + (inputs.size() == 1 ? " image" : " images") + " (" + (bytes / 1024) + " KB) to " + target.model + (inputs.size() > 1 && source(params).equals("canvas") ? " · " + String.join(", ", order) : ""));
     }
 
     long est = estimateSeconds(imageModel, size[0], size[1], steps);
@@ -444,6 +526,7 @@ public class ImageWorker
     out.put("seconds", Math.round(seconds));
     out.put("prompt", prompt);
     out.put("model", imageModel);
+    out.put("seed", seed);
     // imagePath tells the viewer to add the layer; without a layer the client opens the new image instead
     if (layer != null)
     {
@@ -462,7 +545,8 @@ public class ImageWorker
   {
     String source = params.get("source") == null ? "canvas" : params.get("source").toString();
     List<byte[]> inputs = new ArrayList<>();
-    List<Map<String, Object>> all = layers(doc);
+    List<Map<String, Object>> all = doc != null ? layers(doc) : new ArrayList<>();
+    List<String> checked = inputImages(session);
 
     // Explicit layer names (from the AI tool) win over the viewer's source setting
     Set<String> names = new LinkedHashSet<>();
@@ -476,8 +560,12 @@ public class ImageWorker
       {
         Map<String, Object> hit = null;
         for (Map<String, Object> l : all) if (n.equals(l.get("name")) || n.equals(l.get("id")) || n.equals(l.get("src"))) { hit = l; break; }
-        if (hit == null) throw new Exception("No layer named \"" + n + "\". Layers: " + layerNames(all));
-        inputs.add(toPng(readImage(session, layerPath(imagePath, hit))));
+        if (hit != null) { inputs.add(toPng(readImage(session, layerPath(imagePath, hit)))); continue; }
+        // Not a layer: a ticked file may be named by its file name or path, or as "Image N"
+        String file = null;
+        for (int i = 0; i < checked.size(); i++) if (n.equals(checked.get(i)) || n.equals(nameOf(checked.get(i))) || n.equalsIgnoreCase("image " + (i + 1))) { file = checked.get(i); break; }
+        if (file == null) throw new Exception("No layer or ticked image named \"" + n + "\". Layers: " + layerNames(all) + ". Ticked images: " + checked.size());
+        inputs.add(toPng(file.equals(imagePath) ? compose(session, imagePath, doc) : readImage(session, file)));
       }
       return inputs;
     }
@@ -487,15 +575,23 @@ public class ImageWorker
       Object sel = params.get("selected");
       for (Map<String, Object> l : all) if (sel != null && sel.equals(l.get("id"))) inputs.add(toPng(readImage(session, layerPath(imagePath, l))));
       if (inputs.isEmpty()) throw new Exception("No layer is selected in the viewer.");
+      for (String p : checked) if (!p.equals(imagePath)) inputs.add(toPng(readImage(session, p)));
       return inputs;
     }
     if ("layers".equals(source))
     {
       for (Map<String, Object> l : all) if (!Boolean.FALSE.equals(l.get("visible"))) inputs.add(toPng(readImage(session, layerPath(imagePath, l))));
+      for (String p : checked) if (!p.equals(imagePath)) inputs.add(toPng(readImage(session, p)));
       return inputs;
     }
-    inputs.add(toPng(compose(session, imagePath, doc)));
+    for (String p : checked) inputs.add(toPng(p.equals(imagePath) ? compose(session, imagePath, doc) : readImage(session, p)));
+    if (inputs.isEmpty() && doc != null) inputs.add(toPng(compose(session, imagePath, doc)));
     return inputs;
+  }
+
+  private static String source(Map<String, Object> params)
+  {
+    return params.get("source") == null ? "canvas" : params.get("source").toString();
   }
 
   private static String layerNames(List<Map<String, Object>> all)
@@ -576,7 +672,7 @@ public class ImageWorker
     }
   }
 
-  private static String slug(String text)
+  static String slug(String text)
   {
     String s = text == null ? "" : text.toLowerCase().replaceAll("[^a-z0-9]+", " ").trim();
     String[] words = s.isEmpty() ? new String[0] : s.split(" ");

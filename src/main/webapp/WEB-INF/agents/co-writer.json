@@ -1,6 +1,8 @@
 {
   "id": "co-writer",
   "name": "Creative Co-Writer",
+  "personality": false,
+  "characters": true,
   "prompt": "You are a creative co-writer for stories and literature. Focus on character depth, world-building, and emotional arcs. Help the user expand their story based on their ideas.",
   "tools": ["readFile", "patchFile", "writeFile", "askUser"],
   "commands": [
@@ -9,7 +11,7 @@
       "label": "Generate Paragraph",
       "chatlog": false,
       "response": "plaintext",
-      "prompt": "# Immediate Directive:\nYour task is to write the next structural segment of the story. Do not attempt to resolve the overarching plot or wrap it up. Write exactly four descriptive paragraphs. The first two or three paragraphs must integrate and execute the following narrative beat direction/idea:\n[[USER_INPUT]]\n\n# Style Profile:\nWrite exactly four more paragraphs only. No more, no less. NEVER wrap up the story. Avoid repetitive sentences and trite cliches. Never repeat earlier plot developments. Your writing must be distinct, descriptive, authentic, and naturally engaging. Match the literary caliber of a world-renowned, award-winning author: subtle, original, grounded, and deeply nuanced. Focus cleanly on character actions, atmospheric features, and behavioral details."
+      "prompt": "# Immediate Directive:\nYour task is to write the next structural segment of the story. Do not attempt to resolve the overarching plot or wrap it up. Write exactly four descriptive paragraphs. The first two or three paragraphs must integrate and execute the following narrative beat direction/idea:\n[[USER_INPUT]]\n[[CHARACTER]]\n\n# Style Profile:\nWrite exactly four more paragraphs only. No more, no less. NEVER wrap up the story. Avoid repetitive sentences and trite cliches. Never repeat earlier plot developments. Your writing must be distinct, descriptive, authentic, and naturally engaging. Match the literary caliber of a world-renowned, award-winning author: subtle, original, grounded, and deeply nuanced. Focus cleanly on character actions, atmospheric features, and behavioral details."
     },
     {
       "id": "variants",
@@ -17,7 +19,15 @@
       "chatlog": false,
       "response": "variants_json",
 	  "target" : "endContent",
-      "prompt": "# Immediate Directive:\nYour task is to write exactly 3 distinct alternative variants for the next continuous paragraph block. Each variant must be independently constructed based on this specific text idea direction:\n[[USER_INPUT]]\n\n# Formatting & Style Profile:\nRephrase any dialogs from the idea along expanding it.\nIMPORTANT: Provide at least 3 unique choice paths as next paragraph options solely based on the guidance above. Do not jump forward across events or summarize future pages; compose only the next step. Every variant must align with the caliber of a world-renowned, award-winning author: unique, highly original, subtle, grounded, engaging, and realistic."
+      "prompt": "# Immediate Directive:\nYour task is to write exactly 3 distinct alternative variants for the next continuous paragraph block. Each variant must be independently constructed based on this specific text idea direction:\n[[USER_INPUT]]\n[[CHARACTER]]\n\n# Formatting & Style Profile:\nRephrase any dialogs from the idea along expanding it.\nIMPORTANT: Provide at least 3 unique choice paths as next paragraph options solely based on the guidance above. Do not jump forward across events or summarize future pages; compose only the next step. Every variant must align with the caliber of a world-renowned, award-winning author: unique, highly original, subtle, grounded, engaging, and realistic."
+    },
+    {
+      "id": "variants-short",
+      "label": "3 Short",
+      "chatlog": false,
+      "response": "variants_json",
+      "target": "endContent",
+      "prompt": "# Immediate Directive:\nYour task is to write exactly 3 distinct SHORT alternatives for the next beat of the story. Each variant is one to three sentences only, fast-paced, driven by action and dialogue, with no scene-setting and no reflection. Each variant must be independently constructed based on this specific text idea direction:\n[[USER_INPUT]]\n[[CHARACTER]]\n\n# Formatting & Style Profile:\nRephrase any dialogs from the idea along expanding it.\nIMPORTANT: Provide 3 unique choice paths solely based on the guidance above. Do not jump forward across events or summarize future pages; compose only the next step. Keep the caliber of a world-renowned, award-winning author: original, subtle, grounded and realistic, just compressed."
     },
     {
       "id": "rephrase",

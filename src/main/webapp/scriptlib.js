@@ -567,6 +567,9 @@ function initEditor() {
     mode: "markdown",
     theme: "aether",
     lineNumbers: true,
+    spellcheck: true,
+    autocorrect: true,
+    autocapitalize: true,
     extraKeys: {
       "Ctrl-Space": "autocomplete",
       "Tab": handleTabKey
@@ -715,7 +718,7 @@ function setSaveStatus(status) {
 
 function autoSave(callback) {
   // An open image is never saved as text: the hidden editor must not write into it
-  if (!editor || !currentFileUrl || isImageFile(currentFileUrl)) {
+  if (!editor || !currentFileUrl || isViewerFile(currentFileUrl)) {
     if (typeof callback === 'function') callback();
     return;
   }
@@ -762,7 +765,7 @@ function fullSave(content, callback)
 }
 
 function triggerAutoSave() {
-  if (isImageFile(currentFileUrl)) return;
+  if (isViewerFile(currentFileUrl)) return;
   setSaveStatus('unsaved');
   if (saveTimeout) clearTimeout(saveTimeout);
   saveTimeout = setTimeout(autoSave, AUTO_SAVE_DELAY);
@@ -1025,9 +1028,38 @@ function isImageFile(filename) {
   return IMAGE_EXTENSIONS.includes(filename.substring(lastDot + 1).toLowerCase());
 }
 
+// Videos and 3D models open in their own viewers, like images; none of them is ever treated as text
+const VIDEO_EXTENSIONS = ['mp4', 'm4v', 'webm', 'mov'];
+const MODEL_EXTENSIONS = ['glb'];
+
+function fileExtension(filename) {
+  if (!filename) return '';
+  const lastDot = filename.lastIndexOf('.');
+  return lastDot === -1 ? '' : filename.substring(lastDot + 1).toLowerCase();
+}
+
+function isVideoFile(filename) {
+  return VIDEO_EXTENSIONS.includes(fileExtension(filename));
+}
+
+function is3dFile(filename) {
+  return MODEL_EXTENSIONS.includes(fileExtension(filename));
+}
+
+function isViewerFile(filename) {
+  return isImageFile(filename) || isVideoFile(filename) || is3dFile(filename);
+}
+
+function viewForFile(filename) {
+  if (isImageFile(filename)) return 'image';
+  if (isVideoFile(filename)) return 'video';
+  if (is3dFile(filename)) return 'model';
+  return 'editor';
+}
+
 function isSupportedFile(filename) {
   if (!filename) return false;
-  if (isImageFile(filename)) return true;
+  if (isViewerFile(filename)) return true;
   const supportedExtensions = [
     'py', 'java', 'js', 'ts', 'jsx', 'tsx', 'css', 'scss', 'less', 'html', 'htm', 'jsp', 'php', 'asp', 'aspx',
     'sh', 'bat', 'c', 'cpp', 'h', 'hpp', 'cs', 'go', 'rs', 'rb', 'pl', 'pm', 'csv', 'json', 'xml', 'txt', 'md', 'markdown',
@@ -1111,7 +1143,7 @@ function openFileAction(url, el) {
   });
   el.classList.add('opened');
 
-  showView(isImageFile(url) ? 'image' : 'editor');
+  showView(viewForFile(url));
   
   // IMMEDIATELY show loading state and clear content
   const filenameEl = document.getElementById('current-filename');
@@ -1183,6 +1215,180 @@ function selectWorkingDirectory(el) {
   }
 }
 
+// ===== Characters (co-writer): the cast is extracted from AGENTS.md on the server and cached in aether.ing.json =====
+function characterStorageKey()
+{
+  return 'aether.character.' + (window.workingDir || '');
+}
+
+function updateCharacterBar()
+{
+  const bar = document.getElementById('character-bar');
+  if (!bar) return;
+  const on = !!(currentAgent && currentAgent.characters);
+  bar.classList.toggle('hidden', !on);
+  if (on) syncCharacters(false);
+}
+
+// force re-reads AGENTS.md even when it did not change; otherwise the server only answers with the cached list
+function syncCharacters(force)
+{
+  // Quiet on purpose: wsSend would queue it with an "offline" toast, and the socket open handler asks again
+  if (!(ws && ws.readyState === 1)) return;
+  const btn = document.getElementById('character-resync');
+  if (force && btn)
+  {
+    btn.disabled = true;
+    setTimeout(function() { btn.disabled = false; }, 120000);
+  }
+  ws.send(JSON.stringify({ type: 'characters_sync', force: !!force }));
+}
+
+function renderCharacters(data)
+{
+  const select = document.getElementById('character-select');
+  if (!select) return;
+  // An answer for another project (the user switched while it was running) must not fill this list
+  if (data.workingDir && window.workingDir && data.workingDir !== window.workingDir) return;
+  let wanted = select.value;
+  if (!wanted) try { wanted = localStorage.getItem(characterStorageKey()) || ''; } catch (e) {}
+  select.textContent = '';
+  const narrator = document.createElement('option');
+  narrator.value = '';
+  narrator.textContent = 'Narrator';
+  select.appendChild(narrator);
+  (data.characters || []).forEach(function(c) {
+    const opt = document.createElement('option');
+    opt.value = c.name;
+    opt.textContent = c.name;
+    select.appendChild(opt);
+  });
+  select.value = wanted;
+  if (select.value !== wanted) select.value = '';
+  const btn = document.getElementById('character-resync');
+  if (btn) btn.disabled = false;
+}
+
+function onCharacterChange()
+{
+  const select = document.getElementById('character-select');
+  try { localStorage.setItem(characterStorageKey(), select ? select.value : ''); } catch (e) {}
+}
+
+// The pictures an image agent receives, numbered exactly as the server numbers them (ImageWorker.inputImages):
+// ticked images in explorer order, with the open image first when it is not ticked
+let imageOrderSignature = '';
+
+function getInputImageFiles() {
+  if (!(currentAgent && currentAgent.image)) return [];
+  const files = getSelectedContextFiles().filter(isImageFile);
+  if (currentFileUrl && isImageFile(currentFileUrl) && files.indexOf(currentFileUrl) < 0) files.unshift(currentFileUrl);
+  return files;
+}
+
+// @-mentions in the chat input: typing @ offers the ticked files. For image agents these are the numbered input
+// images; the server turns "@name" into "image N" before the prompt reaches the image model
+let mentionItems = [];
+let mentionIndex = 0;
+
+function mentionCandidates() {
+  const names = [];
+  if (currentAgent && currentAgent.image) getInputImageFiles().forEach(function(f, i) { names.push({ name: f.substring(f.lastIndexOf('/') + 1), label: 'Image ' + (i + 1) }); });
+  else
+  {
+    const files = getSelectedContextFiles();
+    if (currentFileUrl && files.indexOf(currentFileUrl) < 0) files.unshift(currentFileUrl);
+    files.forEach(function(f) { names.push({ name: f.substring(f.lastIndexOf('/') + 1), label: f === currentFileUrl ? 'open' : 'ticked' }); });
+  }
+  return names;
+}
+
+function closeMentionPopup() {
+  const pop = document.getElementById('mention-popup');
+  if (pop) pop.classList.add('hidden');
+  mentionItems = [];
+}
+
+function updateMentionPopup() {
+  const input = document.getElementById('chat-input');
+  const pop = document.getElementById('mention-popup');
+  if (!input || !pop) return;
+  const m = /@([^\s@]*)$/.exec(input.value.substring(0, input.selectionStart));
+  if (!m) { closeMentionPopup(); return; }
+  const q = m[1].toLowerCase();
+  mentionItems = mentionCandidates().filter(function(c) { return c.name.toLowerCase().indexOf(q) >= 0; });
+  if (!mentionItems.length) { closeMentionPopup(); return; }
+  if (mentionIndex >= mentionItems.length) mentionIndex = 0;
+  pop.textContent = '';
+  mentionItems.forEach(function(c, i) {
+    const row = document.createElement('div');
+    row.className = 'mention-item' + (i === mentionIndex ? ' active' : '');
+    const label = document.createElement('b');
+    label.textContent = c.label;
+    row.appendChild(label);
+    row.appendChild(document.createTextNode(' ' + c.name));
+    row.onmousedown = function(e) { e.preventDefault(); pickMention(i); };
+    pop.appendChild(row);
+  });
+  pop.classList.remove('hidden');
+}
+
+function pickMention(i) {
+  const input = document.getElementById('chat-input');
+  const item = mentionItems[i];
+  if (!input || !item) return;
+  const before = input.value.substring(0, input.selectionStart).replace(/@[^\s@]*$/, '@' + item.name + ' ');
+  const after = input.value.substring(input.selectionStart);
+  input.value = before + after;
+  input.selectionStart = input.selectionEnd = before.length;
+  closeMentionPopup();
+  input.focus();
+}
+
+document.addEventListener('input', function(e) {
+  if (e.target && e.target.id === 'chat-input') { mentionIndex = 0; updateMentionPopup(); }
+});
+document.addEventListener('keydown', function(e) {
+  if (!e.target || e.target.id !== 'chat-input' || !mentionItems.length) return;
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp')
+  {
+    mentionIndex = (mentionIndex + (e.key === 'ArrowDown' ? 1 : mentionItems.length - 1)) % mentionItems.length;
+    updateMentionPopup();
+  }
+  else if (e.key === 'Enter' || e.key === 'Tab') pickMention(mentionIndex);
+  else if (e.key === 'Escape') closeMentionPopup();
+  else return;
+  e.preventDefault();
+  e.stopImmediatePropagation();
+}, true);
+document.addEventListener('focusout', function(e) { if (e.target && e.target.id === 'chat-input') setTimeout(closeMentionPopup, 150); });
+
+function updateImageOrderStrip() {
+  const strip = document.getElementById('image-order-strip');
+  if (!strip) return;
+  const files = getInputImageFiles();
+  const signature = files.join('|') + '#' + currentFileUrl;
+  if (signature === imageOrderSignature) return;
+  imageOrderSignature = signature;
+  strip.textContent = '';
+  strip.classList.toggle('hidden', files.length === 0);
+  files.forEach(function(f, i) {
+    const chip = document.createElement('span');
+    chip.className = 'image-order-chip' + (f === currentFileUrl ? ' open' : '');
+    const num = document.createElement('b');
+    num.textContent = 'Image ' + (i + 1);
+    chip.appendChild(num);
+    chip.appendChild(document.createTextNode(' ' + f.substring(f.lastIndexOf('/') + 1) + (f === currentFileUrl ? ' (open)' : '')));
+    strip.appendChild(chip);
+  });
+}
+
+document.addEventListener('change', function(e) {
+  if (e.target && e.target.classList && e.target.classList.contains('ctx-toggle')) updateImageOrderStrip();
+});
+// The open file changes in many places; a cheap signature check keeps the strip in step without hooking each one
+setInterval(updateImageOrderStrip, 800);
+
 function getSelectedContextFiles() {
   const checked = document.querySelectorAll('.ctx-toggle:checked');
   const files = [];
@@ -1204,6 +1410,18 @@ function showView(view) {
   if (panel) panel.classList.toggle('hidden', view !== 'browser');
   if (editorCont) editorCont.classList.toggle('hidden', view !== 'editor');
   if (imageCont) imageCont.classList.toggle('hidden', view !== 'image');
+  const videoCont = document.getElementById('video-container');
+  const modelCont = document.getElementById('model-container');
+  if (videoCont) videoCont.classList.toggle('hidden', view !== 'video');
+  if (modelCont) modelCont.classList.toggle('hidden', view !== 'model');
+  // A hidden player must not keep sounding, and a hidden 3D canvas must not keep the GPU busy
+  if (view !== 'video') pauseVideoViewer();
+  if (view === 'model') requestAnimationFrame(resizeModelViewer);
+
+  if (view === 'video' || view === 'model') {
+    const mediaPane = document.getElementById('pane-editor');
+    if (workspace && mediaPane && window.innerWidth <= 768) workspace.scrollTo({ left: mediaPane.offsetLeft, behavior: 'smooth' });
+  }
 
   if (view === 'image') {
     const editorPane = document.getElementById('pane-editor');
@@ -1292,6 +1510,11 @@ function updateEditorFromBuffer() {
     editor.setOption("mode", mode);
     editor.setOption("lineNumbers", isCoding);
     editor.setOption("lineWrapping", !isCoding);
+    // Prose gets the phone keyboard's word suggestions, autocorrect and capitals; CodeMirror turns all three
+    // off by default, and iOS then inserts only the first letter of a chosen suggestion. Code keeps them off
+    editor.setOption("spellcheck", !isCoding);
+    editor.setOption("autocorrect", !isCoding);
+    editor.setOption("autocapitalize", !isCoding);
     editor.setOption("indentUnit", indentUnit);
     editor.setOption("tabSize", indentUnit);
     
@@ -2120,6 +2343,7 @@ function onAIWsOpen()
   sendHello();
   startWsKeepalive();
   requestChatSyncIfEmpty();
+  updateCharacterBar();
 }
 
 function onAIWsClose()
@@ -2189,6 +2413,10 @@ function restoreAIConfig()
   var imageModelSelect = document.getElementById('image-model-select');
   if (cfg.model && modelSelect) modelSelect.value = cfg.model;
   if (cfg.image_model && imageModelSelect) imageModelSelect.value = cfg.image_model;
+  var videoModelSelect = document.getElementById('video-model-select');
+  var model3dSelect = document.getElementById('model3d-model-select');
+  if (cfg.video_model && videoModelSelect) videoModelSelect.value = cfg.video_model;
+  if (cfg.model3d_model && model3dSelect) model3dSelect.value = cfg.model3d_model;
   if (cfg.thinking_mode && thinkingSelect) thinkingSelect.value = cfg.thinking_mode;
   if (cfg.agent_id && agentSelect)
   {
@@ -2483,7 +2711,7 @@ function onAIWsMessage(event)
   } else if (data.type === 'plaintext')
   {
     // Stream content directly into the editor at end of document (never into a hidden editor behind an image)
-    if (editor && !isImageFile(currentFileUrl))
+    if (editor && !isViewerFile(currentFileUrl))
     {
       editor.operation(function() {
         // Place cursor at end of document
@@ -2517,7 +2745,7 @@ function onAIWsMessage(event)
     
     removeToolProgress();
     // Render performance statistics if available (appends to last message, which could be the variants block)
-    if (data.eval_count) renderAiStats(data);
+    if ((data.eval_count || data.total_duration) && data.responseType !== 'image' && data.responseType !== 'video' && data.responseType !== '3d') renderAiStats(data);
 
     aiResponseBuffer = "";
     currentResponseTarget = null;
@@ -2580,12 +2808,18 @@ function onAIWsMessage(event)
   {
     window.aiConfig = data.config;
     restoreAIConfig();
+  } else if (data.type === 'characters_update')
+  {
+    renderCharacters(data);
   } else if (data.type === 'chat_status')
   {
     updateAiStatus(data);
   } else if (data.type === 'image_done')
   {
     onImageDone(data);
+  } else if (data.type === 'media_done')
+  {
+    onMediaDone(data);
   } else if (data.type === 'monitor')
   {
     if (typeof renderMonitor === 'function') renderMonitor(data);
@@ -2660,6 +2894,7 @@ function renderCommandEntry(entry, timeStr)
     else appendMessage('ai', entry.content || '', null, timeStr, entry.model);
   }
   else if (entry.responseType === 'image') appendImageResult(entry.content, entry.input, timeStr, entry.model);
+  else if (entry.responseType === 'video' || entry.responseType === '3d') appendMediaResult(entry.responseType, entry.content, timeStr, entry.model);
   else appendMessage('ai', entry.content || '', null, timeStr, entry.model);
 }
 
@@ -2868,7 +3103,7 @@ function openFileInEditor(fullPath)
     filenameEl.classList.add('loading');
   }
   updateActionButtons();
-  showView(isImageFile(fullPath) ? 'image' : 'editor');
+  showView(viewForFile(fullPath));
   makeRequest('read/' + fullPath, null, false);
 }
 
@@ -3075,6 +3310,9 @@ function onAgentChange()
   if (imageModelSelect) imageModelSelect.classList.toggle('hidden', !isImageAgent);
   const imageControls = document.getElementById('image-ai-controls');
   if (imageControls) imageControls.classList.toggle('hidden', !isImageAgent);
+  updateImageOrderStrip();
+  updateCharacterBar();
+  updateMediaControls();
   const taskOptions = document.getElementById('task-options');
   if (taskOptions) taskOptions.classList.toggle('hidden', !(currentAgent && currentAgent.behavior === 'autonomous'));
   fillReviewerSelect();
@@ -3188,6 +3426,17 @@ function sendChatMessage(message, commandId, commandLabel)
   // While a run works on this chat the message steers it; interrupt mode also cuts the current answer
   if (window.aiWorking && window.steerInterrupt) payload.steer_mode = 'interrupt';
   window.steerInterrupt = false;
+  if (currentAgent && currentAgent.characters)
+  {
+    const characterSelect = document.getElementById('character-select');
+    if (characterSelect && characterSelect.value) payload.character = characterSelect.value;
+  }
+  ['video', 'model3d'].forEach(function(kind) {
+    if (!(currentAgent && currentAgent[kind])) return;
+    const mediaModel = document.getElementById(kind + '-model-select');
+    if (mediaModel && mediaModel.value) payload[kind + '_model_id'] = mediaModel.value;
+    payload[kind + '_params'] = mediaParamsFromPane(kind);
+  });
   if (currentAgent && currentAgent.image)
   {
     const imageModel = document.getElementById('image-model-select');
@@ -3950,8 +4199,10 @@ function renderAiStats(stats)
 {
   const history = document.getElementById('chat-history');
   if (!history) return;
-  const lastMsg = history.lastElementChild;
-  if (!lastMsg || !lastMsg.classList.contains('ai')) return;
+  // The last AI message, even when a tool card or the receiving placeholder sits after it
+  const aiMsgs = history.querySelectorAll('.msg.ai');
+  const lastMsg = aiMsgs.length ? aiMsgs[aiMsgs.length - 1] : null;
+  if (!lastMsg) return;
   // A message gets exactly one stats block; a replayed chat_done must not stack another
   if (lastMsg.querySelector('.ai-stats-block')) return;
 
@@ -3965,7 +4216,7 @@ function renderAiStats(stats)
                        '<div class="stats-content hidden">' +
                        '<div class="stats-item"><span class="stats-label">Total Tokens:</span><span class="stats-value">' + totalTokens + '</span></div>' +
                        '<div class="stats-item"><span class="stats-label">Prompt Tokens:</span><span class="stats-value">' + (stats.prompt_eval_count || 0) + '</span></div>' +
-                       '<div class="stats-item"><span class="stats-label">Generated Tokens:</span><span class="stats-value">' + stats.eval_count + '</span></div>' +
+                       '<div class="stats-item"><span class="stats-label">Generated Tokens:</span><span class="stats-value">' + (stats.stats_approx ? '~' : '') + (stats.eval_count || 0) + '</span></div>' +
                        '<div class="stats-item"><span class="stats-label">Generated TPS:</span><span class="stats-value">' + genTps + '</span></div>' +
                        '<div class="stats-item"><span class="stats-label">First Token:</span><span class="stats-value">' + (stats.ttft_ms ? (stats.ttft_ms / 1000).toFixed(2) + 's' : '—') + '</span></div>' +
                        '<div class="stats-item"><span class="stats-label">Total Time:</span><span class="stats-value">' + (stats.total_duration ? (stats.total_duration / 1e9).toFixed(1) + 's' : '—') + '</span></div>' +
@@ -4955,3 +5206,681 @@ function ensureServerReadable(doc, url, done)
     });
   });
 }
+
+// =====================================================================================================
+// Video viewer, 3D viewer and the video / 3D agents
+// =====================================================================================================
+
+function mediaUrlFor(path)
+{
+  return '/media/' + encodePath(path);
+}
+
+function clearFilenameLoading()
+{
+  const filenameEl = document.getElementById('current-filename');
+  if (filenameEl) filenameEl.classList.remove('loading');
+  const buffer = document.getElementById('file-content-buffer');
+  if (buffer) buffer.value = '';
+}
+
+// ----- Video -----
+let videoUrl = null;
+
+function openVideoViewer()
+{
+  clearFilenameLoading();
+  const player = document.getElementById('video-player');
+  const info = document.getElementById('video-info');
+  if (!player) return;
+  videoUrl = currentFileUrl;
+  if (info) info.textContent = 'Loading…';
+  player.onloadedmetadata = function()
+  {
+    if (info) info.textContent = player.videoWidth + '×' + player.videoHeight + ' · ' + formatSeconds(player.duration);
+  };
+  player.onerror = function()
+  {
+    if (info) info.textContent = 'The browser cannot play this video';
+  };
+  player.src = mediaUrlFor(videoUrl);
+  player.load();
+  showView('video');
+}
+
+function pauseVideoViewer()
+{
+  const player = document.getElementById('video-player');
+  if (player && !player.paused) player.pause();
+}
+
+function toggleVideoLoop(on)
+{
+  const player = document.getElementById('video-player');
+  if (player) player.loop = !!on;
+}
+
+// The frame on screen as a PNG beside the video: to edit it, or to use it as the first frame of the next clip
+function saveVideoFrame()
+{
+  const player = document.getElementById('video-player');
+  if (!player || !player.videoWidth || !videoUrl) return;
+  const canvas = document.createElement('canvas');
+  canvas.width = player.videoWidth;
+  canvas.height = player.videoHeight;
+  canvas.getContext('2d').drawImage(player, 0, 0);
+  canvas.toBlob(function(blob)
+  {
+    if (!blob) return;
+    const name = pathName(videoUrl).replace(/\.[^.]+$/, '') + '-frame-' + Math.round(player.currentTime * 1000) + 'ms.png';
+    const target = siblingPath(videoUrl, name);
+    uploadBytes(target, blob, name, function(ok)
+    {
+      if (!ok) return;
+      showNotification('Saved ' + name);
+      refreshTreeExplorer();
+    });
+  }, 'image/png');
+}
+
+// ----- 3D (three.js, loaded from the CDN only when a model is first opened) -----
+const THREE_CDN = 'https://cdn.jsdelivr.net/npm/three@0.170.0/';
+let m3 = null;          // viewer state once three.js is loaded
+let m3Loading = null;   // the pending import
+let modelUrl = null;
+
+function ensureModelViewer()
+{
+  if (m3) return Promise.resolve(m3);
+  if (m3Loading) return m3Loading;
+  m3Loading = Promise.all([
+    import('three'),
+    import('three/addons/loaders/GLTFLoader.js'),
+    import('three/addons/loaders/DRACOLoader.js'),
+    import('three/addons/controls/OrbitControls.js'),
+    import('three/addons/environments/RoomEnvironment.js'),
+    import('three/addons/libs/meshopt_decoder.module.js')
+  ]).then(function(mods)
+  {
+    const THREE = mods[0];
+    const stage = document.getElementById('model-stage');
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.toneMapping = THREE.NeutralToneMapping;
+    stage.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    scene.environment = pmrem.fromScene(new mods[4].RoomEnvironment(), 0.04).texture;
+
+    const camera = new THREE.PerspectiveCamera(40, 1, 0.01, 1000);
+    const controls = new mods[3].OrbitControls(camera, renderer.domElement);
+    controls.addEventListener('change', renderModel);
+
+    const loader = new mods[1].GLTFLoader();
+    const draco = new mods[2].DRACOLoader();
+    draco.setDecoderPath(THREE_CDN + 'examples/jsm/libs/draco/gltf/');
+    loader.setDRACOLoader(draco);
+    loader.setMeshoptDecoder(mods[5].MeshoptDecoder);
+
+    m3 = { THREE: THREE, renderer: renderer, scene: scene, camera: camera, controls: controls, loader: loader, root: null, meshes: [], mode: 'pbr', stats: null };
+    if (window.ResizeObserver) new ResizeObserver(resizeModelViewer).observe(stage);
+    else window.addEventListener('resize', resizeModelViewer);
+    resizeModelViewer();
+    return m3;
+  });
+  return m3Loading;
+}
+
+function resizeModelViewer()
+{
+  if (!m3) return;
+  const stage = document.getElementById('model-stage');
+  if (!stage || !stage.clientWidth || !stage.clientHeight) return;
+  m3.renderer.setSize(stage.clientWidth, stage.clientHeight, false);
+  m3.camera.aspect = stage.clientWidth / stage.clientHeight;
+  m3.camera.updateProjectionMatrix();
+  renderModel();
+}
+
+// Rendered on demand (camera moved, mode changed, resized): a still model costs no GPU time
+function renderModel()
+{
+  if (!m3) return;
+  const cont = document.getElementById('model-container');
+  if (cont && cont.classList.contains('hidden')) return;
+  m3.renderer.render(m3.scene, m3.camera);
+}
+
+function disposeModel()
+{
+  if (!m3 || !m3.root) return;
+  m3.scene.remove(m3.root);
+  const seen = [];
+  const disposeMaterial = function(mat)
+  {
+    if (!mat || seen.indexOf(mat) >= 0) return;
+    seen.push(mat);
+    ['map', 'normalMap', 'roughnessMap', 'metalnessMap', 'aoMap', 'emissiveMap'].forEach(function(k) { if (mat[k] && mat[k].dispose) mat[k].dispose(); });
+    mat.dispose();
+  };
+  m3.meshes.forEach(function(entry)
+  {
+    entry.mesh.geometry.dispose();
+    (Array.isArray(entry.original) ? entry.original : [entry.original]).forEach(disposeMaterial);
+    Object.keys(entry.cache).forEach(function(k) { (Array.isArray(entry.cache[k]) ? entry.cache[k] : [entry.cache[k]]).forEach(function(mat) { if (mat) mat.dispose(); }); });
+  });
+  m3.root = null;
+  m3.meshes = [];
+  m3.stats = null;
+}
+
+function openModelViewer()
+{
+  clearFilenameLoading();
+  showView('model');
+  const info = document.getElementById('model-info');
+  const openedFor = currentFileUrl;
+  modelUrl = openedFor;
+  if (info) info.textContent = 'Loading 3D viewer…';
+  ensureModelViewer().then(function()
+  {
+    if (modelUrl !== openedFor) return;
+    disposeModel();
+    renderModel();
+    m3.loader.load(mediaUrlFor(openedFor), function(gltf)
+    {
+      if (modelUrl !== openedFor) return;
+      showModel(gltf.scene);
+    }, function(ev)
+    {
+      if (modelUrl !== openedFor || !info) return;
+      info.textContent = ev.total ? 'Loading ' + Math.round(ev.loaded / ev.total * 100) + '% of ' + Math.round(ev.total / 1048576) + ' MB' : 'Loading ' + Math.round(ev.loaded / 1048576) + ' MB…';
+    }, function(err)
+    {
+      if (modelUrl !== openedFor) return;
+      console.log('GLB load failed', err);
+      if (info) info.textContent = 'This model could not be loaded';
+    });
+  }).catch(function(err)
+  {
+    console.log('three.js load failed', err);
+    m3Loading = null;
+    if (info) info.textContent = 'The 3D viewer could not be loaded (no connection to the CDN?)';
+  });
+}
+
+function showModel(root)
+{
+  const THREE = m3.THREE;
+  m3.root = root;
+  m3.meshes = [];
+  const stats = { triangles: 0, vertices: 0, materials: [], hasUv: false, hasVertexColor: false, maps: {} };
+  root.traverse(function(obj)
+  {
+    if (!obj.isMesh) return;
+    const geo = obj.geometry;
+    m3.meshes.push({ mesh: obj, original: obj.material, cache: {} });
+    const pos = geo.attributes.position;
+    stats.vertices += pos ? pos.count : 0;
+    stats.triangles += geo.index ? geo.index.count / 3 : (pos ? pos.count / 3 : 0);
+    if (geo.attributes.uv) stats.hasUv = true;
+    if (geo.attributes.color) stats.hasVertexColor = true;
+    (Array.isArray(obj.material) ? obj.material : [obj.material]).forEach(function(mat)
+    {
+      if (stats.materials.indexOf(mat) < 0) stats.materials.push(mat);
+      [['map', 'base colour'], ['normalMap', 'normal'], ['roughnessMap', 'roughness'], ['metalnessMap', 'metallic'], ['aoMap', 'occlusion'], ['emissiveMap', 'emissive']].forEach(function(pair)
+      {
+        const tex = mat[pair[0]];
+        if (tex && tex.image && !stats.maps[pair[1]]) stats.maps[pair[1]] = (tex.image.width || '?') + '²';
+      });
+    });
+  });
+  m3.stats = stats;
+  m3.scene.add(root);
+
+  // Which views make sense for this model
+  const select = document.getElementById('model-view-mode');
+  const available = { pbr: true, clay: true, normals: true, base: !!stats.maps['base colour'] || stats.hasVertexColor, vertex: stats.hasVertexColor, normalmap: !!stats.maps['normal'], roughness: !!stats.maps['roughness'], metallic: !!stats.maps['metallic'], ao: !!stats.maps['occlusion'], uvchecker: stats.hasUv };
+  if (select)
+  {
+    Array.prototype.forEach.call(select.options, function(opt) { opt.disabled = !available[opt.value]; });
+    select.value = 'pbr';
+  }
+  m3.mode = 'pbr';
+  const wire = document.getElementById('model-wireframe');
+  if (wire) wire.checked = false;
+  const uvToggle = document.getElementById('model-uv-toggle');
+  if (uvToggle) uvToggle.disabled = !stats.hasUv;
+  if (!stats.hasUv) toggleModelUv(false);
+
+  const info = document.getElementById('model-info');
+  if (info)
+  {
+    const maps = Object.keys(stats.maps).map(function(k) { return k + ' ' + stats.maps[k]; });
+    info.textContent = Math.round(stats.triangles).toLocaleString() + ' triangles · ' + stats.vertices.toLocaleString() + ' vertices · '
+      + (stats.hasUv ? 'UV' : 'no UV') + (stats.hasVertexColor ? ' · vertex colours' : '') + (maps.length ? ' · ' + maps.join(', ') : ' · no texture maps');
+    info.title = info.textContent;
+  }
+  resetModelCamera();
+  const uvPanel = document.getElementById('model-uv');
+  if (uvPanel && !uvPanel.classList.contains('hidden')) drawModelUv();
+}
+
+function resetModelCamera()
+{
+  if (!m3 || !m3.root) return;
+  const THREE = m3.THREE;
+  const box = new THREE.Box3().setFromObject(m3.root);
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  const radius = Math.max(size.x, size.y, size.z) * 0.5 || 1;
+  const distance = radius / Math.tan(m3.camera.fov * Math.PI / 360) * 1.5;
+  m3.camera.near = distance / 100;
+  m3.camera.far = distance * 100;
+  m3.camera.position.set(center.x + distance * 0.55, center.y + distance * 0.35, center.z + distance * 0.75);
+  m3.camera.updateProjectionMatrix();
+  m3.controls.target.copy(center);
+  m3.controls.update();
+  renderModel();
+}
+
+// One texture channel shown as grey (roughness, metallic, occlusion), or a whole map shown as stored (normal map)
+function channelMaterial(texture, mask)
+{
+  const THREE = m3.THREE;
+  return new THREE.ShaderMaterial({
+    uniforms: { map: { value: texture }, mask: { value: mask ? new THREE.Vector3(mask[0], mask[1], mask[2]) : new THREE.Vector3(0, 0, 0) }, grey: { value: mask ? 1 : 0 } },
+    vertexShader: 'varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+    fragmentShader: 'uniform sampler2D map; uniform vec3 mask; uniform float grey; varying vec2 vUv; void main() { vec3 c = texture2D(map, vUv).rgb; gl_FragColor = vec4(mix(c, vec3(dot(c, mask)), grey), 1.0); }'
+  });
+}
+
+function uvCheckerTexture()
+{
+  if (m3.checker) return m3.checker;
+  const THREE = m3.THREE;
+  const size = 1024, cells = 8, step = size / cells;
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  ctx.font = 'bold 44px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  for (let y = 0; y < cells; y++) for (let x = 0; x < cells; x++)
+  {
+    ctx.fillStyle = (x + y) % 2 === 0 ? 'hsl(' + (x * 45) + ', 55%, ' + (38 + y * 4) + '%)' : '#e8e8e8';
+    ctx.fillRect(x * step, y * step, step, step);
+    ctx.fillStyle = (x + y) % 2 === 0 ? '#ffffff' : '#333333';
+    ctx.fillText(String.fromCharCode(65 + x) + (y + 1), x * step + step / 2, y * step + step / 2);
+  }
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.flipY = false;
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  m3.checker = tex;
+  return tex;
+}
+
+function modelMaterialFor(original, mode, geometry)
+{
+  const THREE = m3.THREE;
+  const hasColor = !!geometry.attributes.color;
+  const hasUv = !!geometry.attributes.uv;
+  const clay = function() { return new THREE.MeshStandardMaterial({ color: 0xbdbdbd, roughness: 0.75, metalness: 0 }); };
+  switch (mode)
+  {
+    case 'base': return new THREE.MeshBasicMaterial({ map: original.map || null, color: original.color ? original.color.clone() : 0xffffff, vertexColors: hasColor && !!original.vertexColors });
+    case 'vertex': return hasColor ? new THREE.MeshBasicMaterial({ vertexColors: true }) : clay();
+    case 'clay': return clay();
+    case 'normals': return new THREE.MeshNormalMaterial();
+    case 'normalmap': return original.normalMap && hasUv ? channelMaterial(original.normalMap, null) : clay();
+    case 'roughness': return original.roughnessMap && hasUv ? channelMaterial(original.roughnessMap, [0, 1, 0]) : clay();
+    case 'metallic': return original.metalnessMap && hasUv ? channelMaterial(original.metalnessMap, [0, 0, 1]) : clay();
+    case 'ao': return original.aoMap && hasUv ? channelMaterial(original.aoMap, [1, 0, 0]) : clay();
+    case 'uvchecker': return hasUv ? new THREE.MeshBasicMaterial({ map: uvCheckerTexture() }) : clay();
+    default: return original;
+  }
+}
+
+function setModelViewMode(mode)
+{
+  if (!m3 || !m3.root) return;
+  m3.mode = mode;
+  m3.meshes.forEach(function(entry)
+  {
+    if (mode === 'pbr') { entry.mesh.material = entry.original; return; }
+    if (!entry.cache[mode])
+    {
+      entry.cache[mode] = Array.isArray(entry.original)
+        ? entry.original.map(function(mat) { return modelMaterialFor(mat, mode, entry.mesh.geometry); })
+        : modelMaterialFor(entry.original, mode, entry.mesh.geometry);
+    }
+    entry.mesh.material = entry.cache[mode];
+  });
+  toggleModelWireframe();
+}
+
+function toggleModelWireframe()
+{
+  if (!m3 || !m3.root) return;
+  const box = document.getElementById('model-wireframe');
+  const on = !!(box && box.checked);
+  m3.meshes.forEach(function(entry)
+  {
+    const all = [entry.original].concat(Object.keys(entry.cache).map(function(k) { return entry.cache[k]; }));
+    all.forEach(function(m) { (Array.isArray(m) ? m : [m]).forEach(function(mat) { if (mat) mat.wireframe = on; }); });
+  });
+  renderModel();
+}
+
+function toggleModelUv(show)
+{
+  const panel = document.getElementById('model-uv');
+  const toggle = document.getElementById('model-uv-toggle');
+  if (!panel) return;
+  panel.classList.toggle('hidden', !show);
+  if (toggle) toggle.checked = !!show;
+  requestAnimationFrame(function() { resizeModelViewer(); if (show) drawModelUv(); });
+}
+
+// The UV unwrap as a flat picture: the base colour map (when there is one) with every triangle's edges on top
+const UV_MAX_TRIANGLES = 200000;
+
+function drawModelUv()
+{
+  const canvas = document.getElementById('model-uv-canvas');
+  const note = document.getElementById('model-uv-note');
+  if (!canvas || !m3 || !m3.root) return;
+  const size = 1024;
+  canvas.width = canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#1e1e1e';
+  ctx.fillRect(0, 0, size, size);
+
+  let background = null;
+  m3.meshes.forEach(function(entry)
+  {
+    (Array.isArray(entry.original) ? entry.original : [entry.original]).forEach(function(mat) { if (!background && mat.map && mat.map.image) background = mat.map.image; });
+  });
+  if (background) try { ctx.globalAlpha = 0.85; ctx.drawImage(background, 0, 0, size, size); } catch (e) {}
+  ctx.globalAlpha = 1;
+
+  let total = 0;
+  m3.meshes.forEach(function(entry) { const g = entry.mesh.geometry; if (g.attributes.uv) total += g.index ? g.index.count / 3 : g.attributes.uv.count / 3; });
+  const stride = Math.max(1, Math.ceil(total / UV_MAX_TRIANGLES));
+  ctx.strokeStyle = background ? 'rgba(255, 255, 255, 0.55)' : 'rgba(120, 200, 255, 0.8)';
+  ctx.lineWidth = 0.6;
+  ctx.beginPath();
+  m3.meshes.forEach(function(entry)
+  {
+    const g = entry.mesh.geometry;
+    const uv = g.attributes.uv;
+    if (!uv) return;
+    const index = g.index;
+    const count = index ? index.count / 3 : uv.count / 3;
+    for (let t = 0; t < count; t += stride)
+    {
+      const a = index ? index.getX(t * 3) : t * 3, b = index ? index.getX(t * 3 + 1) : t * 3 + 1, c = index ? index.getX(t * 3 + 2) : t * 3 + 2;
+      // glTF keeps the UV origin at the top left, exactly like a canvas
+      ctx.moveTo(uv.getX(a) * size, uv.getY(a) * size);
+      ctx.lineTo(uv.getX(b) * size, uv.getY(b) * size);
+      ctx.lineTo(uv.getX(c) * size, uv.getY(c) * size);
+      ctx.closePath();
+    }
+  });
+  ctx.stroke();
+  if (note) note.textContent = stride > 1 ? 'Showing every ' + stride + (stride === 2 ? 'nd' : stride === 3 ? 'rd' : 'th') + ' triangle of ' + Math.round(total).toLocaleString() : Math.round(total).toLocaleString() + ' triangles';
+}
+
+// What the 3D view shows right now, as a PNG beside the model
+function saveModelSnapshot()
+{
+  if (!m3 || !m3.root || !modelUrl) return;
+  // Rendered and read in the same tick: the drawing buffer is not kept between frames
+  m3.renderer.render(m3.scene, m3.camera);
+  m3.renderer.domElement.toBlob(function(blob)
+  {
+    if (!blob) return;
+    const name = pathName(modelUrl).replace(/\.[^.]+$/, '') + '-view-' + fileTimestamp() + '.png';
+    uploadBytes(siblingPath(modelUrl, name), blob, name, function(ok)
+    {
+      if (!ok) return;
+      showNotification('Saved ' + name);
+      refreshTreeExplorer();
+    });
+  }, 'image/png');
+}
+
+// ----- Results of the video / 3D agents -----
+function appendMediaResult(kind, path, timeStr, model)
+{
+  if (!path) return;
+  const msgDiv = appendMessage('ai', (kind === 'video' ? '🎬 ' : '🧊 ') + pathName(path), null, timeStr, model);
+  if (!msgDiv) return;
+  const content = msgDiv.querySelector('.msg-content');
+  if (kind === 'video')
+  {
+    const video = document.createElement('video');
+    video.className = 'chat-image-thumb';
+    video.controls = true;
+    video.preload = 'none';
+    video.playsInline = true;
+    video.src = mediaUrlFor(path);
+    content.appendChild(video);
+  }
+  const open = document.createElement('button');
+  open.className = 'p-btn';
+  open.textContent = kind === 'video' ? 'Open in player' : 'Open in 3D viewer';
+  open.onclick = function() { openFileInEditor(path); };
+  content.appendChild(open);
+  scrollToBottomIfWatching(document.getElementById('chat-history'));
+}
+
+function onMediaDone(data)
+{
+  appendMediaResult(data.kind, data.path, null, data.model);
+  refreshTreeExplorer();
+  openFileInEditor(data.path);
+}
+
+// ----- Settings of the video / 3D model, generated from the parameter list the model publishes -----
+function mediaModelInfoFor(kind)
+{
+  const select = document.getElementById(kind + '-model-select');
+  return select && select.value && window.mediaModelInfo ? window.mediaModelInfo[select.value] || null : null;
+}
+
+function mediaStorageKey(kind)
+{
+  const select = document.getElementById(kind + '-model-select');
+  return 'aether.media.' + kind + '.' + (select ? select.value : '');
+}
+
+function updateMediaControls()
+{
+  ['video', 'model3d'].forEach(function(kind)
+  {
+    const on = !!(currentAgent && currentAgent[kind]);
+    const select = document.getElementById(kind + '-model-select');
+    const box = document.getElementById(kind + '-ai-controls');
+    if (select) select.classList.toggle('hidden', !on);
+    if (box) box.classList.toggle('hidden', !on);
+    if (on) renderMediaParams(kind);
+  });
+}
+
+function renderMediaParams(kind)
+{
+  const box = document.getElementById(kind + '-ai-controls');
+  if (!box) return;
+  box.textContent = '';
+  const info = mediaModelInfoFor(kind);
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(mediaStorageKey(kind)) || '{}'); } catch (e) {}
+
+  const addField = function(name, spec)
+  {
+    const label = document.createElement('label');
+    label.title = spec.description || name;
+    label.appendChild(document.createTextNode(name.replace(/_/g, ' ') + ' '));
+    let input;
+    if (spec.type === 'enum' || spec.type === 'bool')
+    {
+      input = document.createElement('select');
+      const auto = document.createElement('option');
+      auto.value = '';
+      auto.textContent = spec.default !== undefined ? 'default (' + spec.default + ')' : 'default';
+      input.appendChild(auto);
+      (spec.type === 'bool' ? ['true', 'false'] : (spec.values || [])).forEach(function(v)
+      {
+        const opt = document.createElement('option');
+        opt.value = String(v);
+        opt.textContent = spec.type === 'bool' ? (v === 'true' ? 'on' : 'off') : String(v);
+        input.appendChild(opt);
+      });
+    }
+    else
+    {
+      input = document.createElement('input');
+      input.type = spec.type === 'int' || spec.type === 'number' ? 'number' : 'text';
+      if (spec.min !== undefined) input.min = spec.min;
+      if (spec.max !== undefined) input.max = spec.max;
+      if (spec.type === 'number') input.step = 'any';
+      else if (spec.step !== undefined) input.step = spec.step;
+      input.placeholder = spec.default !== undefined ? String(spec.default) : 'auto';
+      if (input.type === 'text') input.className = 'media-text-field';
+    }
+    input.dataset.param = name;
+    if (saved[name] !== undefined) input.value = saved[name];
+    input.onchange = function() { saveMediaParams(kind); };
+    label.appendChild(input);
+    box.appendChild(label);
+  };
+
+  const params = info && info.parameters ? info.parameters : null;
+  if (kind === 'video') addField('seconds', { type: 'number', min: 1, max: 20, description: 'Clip length in seconds. Longer clips take proportionally longer to generate.' });
+  if (params)
+  {
+    Object.keys(params).forEach(function(name)
+    {
+      const spec = params[name];
+      // Pictures come from the order strip, the prompt from the chat box, and the length is asked as seconds
+      if (!spec || spec.type === 'image' || name === 'prompt' || name === 'frames') return;
+      addField(name, spec);
+    });
+  }
+  else if (kind === 'video')
+  {
+    addField('size', { type: 'string', description: 'WIDTHxHEIGHT, e.g. 768x448' });
+    addField('steps', { type: 'int', min: 1, max: 100 });
+    addField('seed', { type: 'int', min: 0 });
+  }
+
+  const addFrameBox = function(id, text, title, on)
+  {
+    const label = document.createElement('label');
+    label.title = title;
+    const check = document.createElement('input');
+    check.type = 'checkbox';
+    check.id = id;
+    check.checked = on;
+    check.onchange = function() { saveMediaParams(kind); };
+    label.appendChild(check);
+    label.appendChild(document.createTextNode(' ' + text));
+    box.appendChild(label);
+  };
+  if (kind === 'video' && (!params || params.image)) addFrameBox('video-first-frame', 'First frame: Image 1', 'Animate Image 1 of the strip above the prompt (image-to-video). Untick for text-to-video.', saved.__first !== false);
+  if (kind === 'video' && params && params.end_image) addFrameBox('video-last-frame', 'Last frame: Image 2', 'End the clip on Image 2 of the strip above the prompt.', saved.__last === true);
+  if (kind === 'model3d')
+  {
+    const note = document.createElement('span');
+    note.textContent = 'Builds from Image 1';
+    note.title = 'The 3D model is built from Image 1 of the strip above the prompt: one object, whole, on a plain or transparent background.';
+    box.appendChild(note);
+  }
+  if (info && (info.title || info.description))
+  {
+    box.title = (info.title ? info.title + '. ' : '') + (info.description || '');
+  }
+}
+
+function saveMediaParams(kind)
+{
+  const box = document.getElementById(kind + '-ai-controls');
+  if (!box) return;
+  const values = {};
+  box.querySelectorAll('[data-param]').forEach(function(el) { if (el.value !== '') values[el.dataset.param] = el.value; });
+  const first = document.getElementById('video-first-frame');
+  const last = document.getElementById('video-last-frame');
+  if (kind === 'video' && first) values.__first = first.checked;
+  if (kind === 'video' && last) values.__last = last.checked;
+  try { localStorage.setItem(mediaStorageKey(kind), JSON.stringify(values)); } catch (e) {}
+}
+
+// The form as request fields; an empty field is left out so the model's own default applies
+function mediaParamsFromPane(kind)
+{
+  const box = document.getElementById(kind + '-ai-controls');
+  const values = {};
+  if (!box) return values;
+  box.querySelectorAll('[data-param]').forEach(function(el) { if (el.value !== '') values[el.dataset.param] = el.value; });
+  if (kind === 'video')
+  {
+    const inputs = getInputImageFiles();
+    const first = document.getElementById('video-first-frame');
+    const last = document.getElementById('video-last-frame');
+    if (first && first.checked && inputs.length > 0) values.image = 'Image 1';
+    if (last && last.checked && inputs.length > 1) values.end_image = 'Image 2';
+  }
+  return values;
+}
+
+// ----- Mobile: the keyboard follows the pane -----
+// The three panes are swiped sideways on a phone, and the keyboard kept typing into whatever had the cursor
+// before the swipe. When a text field has focus and another pane snaps into place, focus moves with it: to the
+// prompt box on the AI pane, back to the editor (CodeMirror keeps its cursor and selection) on the editor pane.
+// With no field focused nothing happens, so a swipe never pops the keyboard up by itself.
+let paneFocusTimer = null;
+
+function settlePaneFocus()
+{
+  if (window.innerWidth > 768) return;
+  const workspace = document.getElementById('workspace');
+  const active = document.activeElement;
+  if (!workspace || !active || active === document.body) return;
+  const typing = active.tagName === 'TEXTAREA' || active.tagName === 'INPUT' || active.isContentEditable;
+  if (!typing) return;
+
+  let current = null;
+  ['pane-files', 'pane-editor', 'pane-chat'].forEach(function(id)
+  {
+    const pane = document.getElementById(id);
+    if (pane && Math.abs(pane.offsetLeft - workspace.scrollLeft) < pane.offsetWidth / 2) current = pane;
+  });
+  if (!current || current.contains(active)) return;
+
+  if (current.id === 'pane-chat')
+  {
+    const input = document.getElementById('chat-input');
+    if (input) input.focus({ preventScroll: true });
+  }
+  else if (current.id === 'pane-editor' && editor && !isViewerFile(currentFileUrl))
+  {
+    const editorCont = document.getElementById('editor-container');
+    if (editorCont && !editorCont.classList.contains('hidden')) editor.focus();
+    else active.blur();
+  }
+  else active.blur();
+}
+
+document.addEventListener('DOMContentLoaded', function()
+{
+  const workspace = document.getElementById('workspace');
+  if (!workspace) return;
+  workspace.addEventListener('scroll', function()
+  {
+    if (paneFocusTimer) clearTimeout(paneFocusTimer);
+    paneFocusTimer = setTimeout(settlePaneFocus, 180);
+  }, { passive: true });
+});

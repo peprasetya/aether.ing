@@ -12,6 +12,9 @@ public class Agent
   private List<AgentCommand> commands;
   // Image agents also drive an image model: the UI shows the image model selector and controls
   private boolean image;
+  private boolean personality = true;
+  private boolean video;
+  private boolean model3d;
   // "interactive" (a chat turn, the default) or "autonomous" (loops until its stop gates pass)
   private String behavior;
   // Default reviewer model ("Provider::model") for the stop gates; the run may override it
@@ -36,6 +39,14 @@ public class Agent
   public List<AgentCommand> getCommands() { return commands; }
   public void setCommands(List<AgentCommand> commands) { this.commands = commands; }
   public boolean isImage() { return image; }
+  // Whether the learned user personality is injected into this agent's prompts and updated after its turns
+  // Agents that can order a video or a 3D model from their own model kind (see MediaWorker)
+  public boolean isVideo() { return video; }
+  public void setVideo(boolean video) { this.video = video; }
+  public boolean isModel3d() { return model3d; }
+  public void setModel3d(boolean model3d) { this.model3d = model3d; }
+  public boolean isPersonality() { return personality; }
+  public void setPersonality(boolean personality) { this.personality = personality; }
   public void setImage(boolean image) { this.image = image; }
   public String getBehavior() { return behavior; }
   public void setBehavior(String behavior) { this.behavior = behavior; }
