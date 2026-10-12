@@ -2345,6 +2345,7 @@ public class AgentWorker
           properties.put("end_image", Map.of("type", "string", "description", "Last frame, same naming. Only for models that list end_image."));
           properties.put("seconds", Map.of("type", "number", "description", "Clip length in seconds. Omit to use the user's setting."));
           properties.put("size", Map.of("type", "string", "description", "WIDTHxHEIGHT, e.g. 768x448. Omit to use the user's setting."));
+          properties.put("size_from", Map.of("type", "string", "enum", Arrays.asList("set", "aspect", "image"), "description", "With a first frame: 'aspect' gives the clip the picture's aspect ratio at about the usual pixel count (recommended, avoids stretching or cropping), 'image' uses the picture's own resolution (slower for large pictures), 'set' uses size as given. Omit to use the user's setting."));
           properties.put("options", Map.of("type", "object", "description", "Other parameters of the selected video model, exactly as listed in the workspace context (for example steps, seed, negative_prompt)."));
           properties.put("name", Map.of("type", "string", "description", "Short file-name hint."));
           required.add("prompt");

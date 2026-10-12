@@ -5759,7 +5759,15 @@ function renderMediaParams(kind)
   };
 
   const params = info && info.parameters ? info.parameters : null;
-  if (kind === 'video') addField('seconds', { type: 'number', min: 1, max: 20, description: 'Clip length in seconds. Longer clips take proportionally longer to generate.' });
+  if (kind === 'video')
+  {
+    // The longest clip the model accepts, from its own frame limit; its default length applies when the field is empty
+    const frames = params && params.frames ? params.frames : null;
+    const fps = params && params.fps && typeof params.fps.default === 'number' ? params.fps.default : 24;
+    const maxSeconds = frames && frames.max ? Math.floor(frames.max / fps) : 20;
+    const defaultSeconds = frames && typeof frames.default === 'number' ? Math.round(frames.default / fps) : undefined;
+    addField('seconds', { type: 'number', min: 1, max: maxSeconds, default: defaultSeconds, description: 'Clip length in seconds, up to ' + maxSeconds + ' for this model. Empty uses the model\'s own default. Longer clips take proportionally longer to generate.' });
+  }
   if (params)
   {
     Object.keys(params).forEach(function(name)
@@ -5790,6 +5798,24 @@ function renderMediaParams(kind)
     label.appendChild(document.createTextNode(' ' + text));
     box.appendChild(label);
   };
+  if (kind === 'video' && (!params || params.image))
+  {
+    const label = document.createElement('label');
+    label.title = 'The size of a clip that starts from a picture. Matching the aspect ratio keeps the picture from being stretched or cropped; the width and height fields then only set how many pixels the clip has.';
+    const select = document.createElement('select');
+    [['aspect', 'Size: Image 1 aspect ratio'], ['image', 'Size: Image 1 resolution'], ['set', 'Size: as set']].forEach(function(pair)
+    {
+      const opt = document.createElement('option');
+      opt.value = pair[0];
+      opt.textContent = pair[1];
+      select.appendChild(opt);
+    });
+    select.dataset.param = 'size_from';
+    select.value = saved.size_from || 'aspect';
+    select.onchange = function() { saveMediaParams(kind); };
+    label.appendChild(select);
+    box.appendChild(label);
+  }
   if (kind === 'video' && (!params || params.image)) addFrameBox('video-first-frame', 'First frame: Image 1', 'Animate Image 1 of the strip above the prompt (image-to-video). Untick for text-to-video.', saved.__first !== false);
   if (kind === 'video' && params && params.end_image) addFrameBox('video-last-frame', 'Last frame: Image 2', 'End the clip on Image 2 of the strip above the prompt.', saved.__last === true);
   if (kind === 'model3d')

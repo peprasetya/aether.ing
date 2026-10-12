@@ -117,8 +117,26 @@ public class MediaWorker
     if (!video && imagePath == null) throw new Exception("3D needs a picture of the object. Open or tick an image, or generate one first.");
     if (imagePath != null)
     {
-      body.put("image", dataUrl(session, imagePath));
+      byte[] png = ImageWorker.inputPng(session, imagePath);
+      body.put("image", "data:image/png;base64," + Base64.getEncoder().encodeToString(png));
       used.add(ImageWorker.nameOf(imagePath));
+      // A clip in another aspect ratio than its first frame stretches or crops the picture
+      String sizeFrom = params.get("size_from") == null ? "" : params.get("size_from").toString();
+      if (video && ("aspect".equals(sizeFrom) || "image".equals(sizeFrom)))
+      {
+        int[] fitted = sizeFromImage(png, "image".equals(sizeFrom), body, allowed);
+        if (fitted != null)
+        {
+          body.remove("size");
+          if (allowed != null && allowed.containsKey("width") && allowed.containsKey("height"))
+          {
+            body.put("width", (long) fitted[0]);
+            body.put("height", (long) fitted[1]);
+          }
+          else body.put("size", fitted[0] + "x" + fitted[1]);
+          used.add(fitted[0] + "×" + fitted[1]);
+        }
+      }
     }
     if (video && allowed != null && allowed.containsKey("end_image"))
     {
@@ -273,6 +291,45 @@ public class MediaWorker
     String path = ImageWorker.resolveInput(session, name);
     if (path == null) throw new Exception("No picture named \"" + name + "\" is open or ticked. Pictures available: " + ImageWorker.inputImages(session).size() + " (Image 1, Image 2, … in explorer order).");
     return path;
+  }
+
+  // Width and height in the picture's aspect ratio, inside what the model accepts. exact keeps the picture's own
+  // pixel count; otherwise the pixel count of the size that would have been used (the user's or the model's default)
+  // is kept, so matching the shape of a large photo does not also multiply the generation time
+  @SuppressWarnings("unchecked")
+  private static int[] sizeFromImage(byte[] png, boolean exact, Map<String, Object> body, Map<String, Object> allowed)
+  {
+    java.awt.image.BufferedImage img;
+    try { img = javax.imageio.ImageIO.read(new java.io.ByteArrayInputStream(png)); } catch (Exception e) { return null; }
+    if (img == null || img.getWidth() < 1 || img.getHeight() < 1) return null;
+    Map<String, Object> ws = allowed != null && allowed.get("width") instanceof Map ? (Map<String, Object>) allowed.get("width") : new HashMap<>();
+    Map<String, Object> hs = allowed != null && allowed.get("height") instanceof Map ? (Map<String, Object>) allowed.get("height") : new HashMap<>();
+
+    double baseW = ImageWorker.asDouble(body.get("width"), ImageWorker.asDouble(ws.get("default"), 768));
+    double baseH = ImageWorker.asDouble(body.get("height"), ImageWorker.asDouble(hs.get("default"), 448));
+    if (body.get("size") != null && body.get("size").toString().matches("\\d+x\\d+"))
+    {
+      String[] wh = body.get("size").toString().split("x");
+      baseW = Double.parseDouble(wh[0]);
+      baseH = Double.parseDouble(wh[1]);
+    }
+    double ratio = (double) img.getWidth() / img.getHeight();
+    double w = exact ? img.getWidth() : Math.sqrt(baseW * baseH * ratio);
+    double h = w / ratio;
+
+    double minW = ImageWorker.asDouble(ws.get("min"), 64), maxW = ImageWorker.asDouble(ws.get("max"), 4096);
+    double minH = ImageWorker.asDouble(hs.get("min"), 64), maxH = ImageWorker.asDouble(hs.get("max"), 4096);
+    // Shrink into the largest allowed frame first, then grow to the smallest: the ratio wins over the pixel count
+    double f = Math.min(1.0, Math.min(maxW / w, maxH / h));
+    w *= f;
+    h *= f;
+    f = Math.max(1.0, Math.max(minW / w, minH / h));
+    w *= f;
+    h *= f;
+    int stepW = Math.max(1, ImageWorker.asInt(ws.get("step"), 32)), stepH = Math.max(1, ImageWorker.asInt(hs.get("step"), 32));
+    int rw = (int) Math.max(minW, Math.min(maxW, Math.round(w / stepW) * stepW));
+    int rh = (int) Math.max(minH, Math.min(maxH, Math.round(h / stepH) * stepH));
+    return new int[] { rw, rh };
   }
 
   private static String dataUrl(HttpSession session, String path) throws Exception
