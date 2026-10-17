@@ -51,6 +51,8 @@ body {
   display: flex;
   flex-direction: column;
   height: 100vh;
+  height: 100dvh;
+  height: var(--app-height, 100dvh);
   overflow: hidden;
   overscroll-behavior-x: contain;
 }
@@ -968,6 +970,7 @@ body.logged-out .workspace {
 body.logged-out #pane-editor {
   border-right: none;
   height: 100vh;
+  height: var(--app-height, 100dvh);
 }
 
 @media (max-width: 768px) {

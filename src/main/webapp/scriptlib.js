@@ -5862,6 +5862,28 @@ function mediaParamsFromPane(kind)
   return values;
 }
 
+// ----- Mobile: the visible height -----
+// 100vh on iOS is the height with every browser bar hidden. Safari shrinks its bars, but browsers that keep a
+// bar on top and another at the bottom (DuckDuckGo) leave less room, so the header or the prompt box fell off
+// screen with no way to scroll back. The body takes the height that is actually visible: the visual viewport
+// when no field is focused (outside the keyboard), the layout viewport otherwise so the keyboard does not
+// squeeze the panes. A page pushed up by the browser is scrolled back to the top.
+function fitAppHeight()
+{
+  const vv = window.visualViewport;
+  const typing = document.activeElement && document.activeElement.matches('input, textarea, [contenteditable="true"]');
+  const height = vv && !typing ? Math.min(vv.height, window.innerHeight) : window.innerHeight;
+  document.documentElement.style.setProperty('--app-height', Math.round(height) + 'px');
+  if (!typing && (window.scrollY || document.documentElement.scrollTop)) window.scrollTo(0, 0);
+}
+
+fitAppHeight();
+window.addEventListener('resize', fitAppHeight);
+window.addEventListener('orientationchange', function() { setTimeout(fitAppHeight, 300); });
+window.addEventListener('pageshow', fitAppHeight);
+document.addEventListener('focusout', function() { setTimeout(fitAppHeight, 300); });
+if (window.visualViewport) window.visualViewport.addEventListener('resize', fitAppHeight);
+
 // ----- Mobile: the keyboard follows the pane -----
 // The three panes are swiped sideways on a phone, and the keyboard kept typing into whatever had the cursor
 // before the swipe. When a text field has focus and another pane snaps into place, focus moves with it: to the
