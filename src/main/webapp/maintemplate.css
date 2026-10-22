@@ -1868,6 +1868,9 @@ dialog::backdrop {
   margin: 10px 0;
   padding: 10px;
   flex-shrink: 0;
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 .question-header {
@@ -1898,6 +1901,14 @@ dialog::backdrop {
   flex-wrap: wrap;
   gap: 6px;
   margin-bottom: 6px;
+}
+
+.q-opt {
+  white-space: normal;
+  max-width: 100%;
+  height: auto;
+  text-align: left;
+  overflow-wrap: anywhere;
 }
 
 .q-opt.selected {
