@@ -8,6 +8,13 @@
   An AI-native file editor and IDE that runs in the browser, backed by a self-hosted Java server.
 </p>
 
+<p align="center">
+  <a href="https://aether.ing"><b>aether.ing</b></a> — official website ·
+  <a href="https://aether.ing/hemera/">Hemera</a> — the companion model server ·
+  <a href="https://aether.ing/privacy.html">Privacy</a> ·
+  <a href="https://aether.ing/tos.html">Terms</a>
+</p>
+
 Aether is a triple-pane workspace — **Explorer**, **Editor**, and **AI Assistant** — for browsing, editing, and chatting with an LLM about files that live on your local disk, a remote server over SSH, or Google Drive. Beyond text and code it opens images, video and 3D models in their own viewers, and its agents can generate all three.
 
 There is no build framework, no ORM, and no bundler. It's plain Java, JSP, and JavaScript, deployed straight into a Jetty container.
@@ -19,7 +26,7 @@ There is no build framework, no ORM, and no bundler. It's plain Java, JSP, and J
 - **AI assistant with tool use** — agents (defined as JSON in `WEB-INF/agents/`) can read, write, patch, rename, move, copy, and search files, run commands, and ask the user for permission before any destructive action, streamed live over a WebSocket.
 - **Background agent runs** — every AI turn is a run owned by the user, not by the browser tab: it keeps working when the tab is closed, can be followed, steered, paused or answered from any device, survives a server restart, and can notify you by Web Push. Autonomous task agents only finish through stop gates (todos done, the project's verify command, a reviewer model).
 - **Image studio** — a layered image viewer (move, scale, rotate, merge) with AI generation and editing. Ticked images and the open canvas are numbered Image 1..N, shown to the chat model and sent to the image model in that order; `@file` mentions in the prompt resolve to those numbers.
-- **Video and 3D studios** — agents that plan with you, refine the source picture first, then order a video clip or a 3D mesh from a model server such as hemera. A built-in player handles `mp4`/`m4v`/`webm`/`mov`; a three.js viewer opens `.glb` with PBR lighting, single-map views (base colour, normal, roughness, metallic, occlusion), vertex colours, a UV checker, a UV layout panel and wireframe.
+- **Video and 3D studios** — agents that plan with you, refine the source picture first, then order a video clip or a 3D mesh from a model server such as [Hemera](https://aether.ing/hemera/). A built-in player handles `mp4`/`m4v`/`webm`/`mov`; a three.js viewer opens `.glb` with PBR lighting, single-map views (base colour, normal, roughness, metallic, occlusion), vertex colours, a UV checker, a UV layout panel and wireframe.
 - **Creative co-writer** — paragraph, variation, rephrase and suggestion commands for long-form writing. The cast is read from the project's `AGENTS.md` by a model and offered as a dropdown, so a passage can dwell on one character without changing the narration.
 - **Bring your own model provider** — connect any number of OpenAI-compatible endpoints (Ollama, LM Studio, OpenRouter, Lemonade, hosted frontier APIs, ...) at once; every model from every provider shows up in a selector for its kind (text, image, video, 3D), labeled by provider. Settings for media models are generated from the parameter list the model server publishes.
 - **Google Drive integration** — all your data (settings, chat sessions, and optionally the files themselves) can live in your own Google Drive.
