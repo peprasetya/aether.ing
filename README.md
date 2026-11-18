@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="src/main/webapp/images/Aether.ing.png" alt="Aether" width="96" />
+  <img src="src/main/webapp/images/Aether.ing.png" alt="aether.ing" width="96" />
 </p>
 
-<h1 align="center">Aether</h1>
+<h1 align="center">aether.ing</h1>
 
 <p align="center">
   An AI-native file editor and IDE that runs in the browser, backed by a self-hosted Java server.
@@ -15,7 +15,7 @@
   <a href="https://aether.ing/tos.html">Terms</a>
 </p>
 
-Aether is a triple-pane workspace — **Explorer**, **Editor**, and **AI Assistant** — for browsing, editing, and chatting with an LLM about files that live on your local disk, a remote server over SSH, or Google Drive. Beyond text and code it opens images, video and 3D models in their own viewers, and its agents can generate all three.
+aether.ing is a triple-pane workspace — **Explorer**, **Editor**, and **AI Assistant** — for browsing, editing, and chatting with an LLM about files that live on your local disk, a remote server over SSH, or Google Drive. Beyond text and code it opens images, video and 3D models in their own viewers, and its agents can generate all three.
 
 There is no build framework, no ORM, and no bundler. It's plain Java, JSP, and JavaScript, deployed straight into a Jetty container.
 
@@ -49,7 +49,7 @@ No Spring, no Maven/Gradle, no ORM.
 
 ## Architecture
 
-Aether follows a small variant of the Front Controller / Command pattern:
+aether.ing follows a small variant of the Front Controller / Command pattern:
 
 1. **`Portal`** (a `WebFilter`) intercepts every request and routes it via **`CommandInitializer`**, which scans for `@CommandRegister` annotations on bean classes.
 2. Each request is handled by a **`BeanObject`** subclass (e.g. `DocumentBean`, `BrowseBean`, `SettingBean`). Parameters are injected by `Portal` through public setters — beans never call `request.getParameter()` directly.
